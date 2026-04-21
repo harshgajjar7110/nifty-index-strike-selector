@@ -32,6 +32,8 @@ python run_pipeline.py --mode retrain
 
 ✅ **Live Orchestration** — Single command updates all data, retrains GARCH, generates strikes every Sunday
 
+✅ **Directional Credit Spreads** — Generates Bull Put and Bear Call spreads across weekly and monthly expiries with DTE-aware scaling and EV ranking
+
 ## Architecture
 
 ```
@@ -48,8 +50,10 @@ Conformal Calibration (M5)
 Strike Generation (M6) ←→ Backtester (M7)
     ↓                          ↓
 Live Pipeline (M8)         Equity Curve + Metrics
-
+    ↓
+Credit Spreads (M9)
 ```
+
 
 ## Configuration
 

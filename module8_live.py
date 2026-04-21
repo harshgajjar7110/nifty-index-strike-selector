@@ -240,13 +240,18 @@ def run_live_pipeline() -> dict:
             logger.success(f"Credit spreads → {SPREADS_JSON}")
             
             # Console summary
-            top = spreads_result.get("summary", {}).get("top_pick")
-            if top:
-                print(f"\n  ★ Top Credit Spread")
-                print(f"    Type:  {top['spread_type']} | Expiry: {top['expiry_date']}")
-                print(f"    Legs:  {top['short_strike']} / {top['long_strike']} (±{top['wing_width']} pts)")
-                print(f"    Premium: {top['premium_pts']:.1f} pts | Max Loss: {top['max_loss_pts']:.1f} pts")
-                print(f"    R:R: {top['rr_ratio']:.2%} | POP: {top.get('pop_pct', 0)*100:.1f}% | EV: {top['ev_proxy']:.3f}")
+            spreads = spreads_result.get("spreads", [])
+            top_bull = next((s for s in spreads if s["spread_type"] == "bull_put"), None)
+            top_bear = next((s for s in spreads if s["spread_type"] == "bear_call"), None)
+
+            if top_bull or top_bear:
+                print(f"\n  ★ Top Credit Spreads by Regime")
+                
+                for label, s in [("Bull Put ", top_bull), ("Bear Call", top_bear)]:
+                    if s:
+                        meets = "✓" if s.get("meets_min_rr") else "✗"
+                        print(f"    {label}:  {s['short_strike']}/{s['long_strike']} | Expiry: {s['expiry_date']} ({s['expiry_type']})")
+                        print(f"                Premium: {s['premium_pts']:.1f} pts | R:R: {s['rr_ratio']:.2%} | POP: {s.get('pop_pct', 0)*100:.1f}% | Min RR: {meets}")
             
         except ImportError:
             logger.warning("module9_spreads not found — skipping credit spread generation")

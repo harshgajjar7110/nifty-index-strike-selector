@@ -35,6 +35,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from module6_strikes import predict_range, generate_strikes, _load_config  # noqa: E402
+from module10_nse_costs import calculate_nse_charges, apply_slippage
 
 # ---------------------------------------------------------------------------
 # Load configuration from module6 and environment
@@ -213,22 +214,31 @@ def run_backtest() -> dict:
     logger.info(f"Processed {len(results)} test weeks")
 
     # ------------------------------------------------------------------
-    # 4. P&L simulation (per-row premium)
+    # 4. P&L simulation (per-row premium + SL + Costs)
     # ------------------------------------------------------------------
-    pnl_list = []
+    pnl_gross_list = []
+    pnl_net_list = []
     won_list = []
     breach_up_list = []
     breach_down_list = []
+    costs_list = []
+
+    # Config for optimization
+    SL_MULTIPLIER = 3.0  # Stop Loss at 3x entry premium
+    SLIPPAGE_ENTRY = 1.0 # 1 pt slippage per leg on entry
+    SLIPPAGE_EXIT = 0.5  # 0.5 pt slippage per leg on exit (or expiry)
 
     for _, row in results.iterrows():
         close = row["current_close"]
         actual_log_range = row["actual_log_range"]
 
         if np.isnan(actual_log_range):
-            pnl_list.append(np.nan)
+            pnl_gross_list.append(np.nan)
+            pnl_net_list.append(np.nan)
             won_list.append(np.nan)
             breach_up_list.append(np.nan)
             breach_down_list.append(np.nan)
+            costs_list.append(0.0)
             continue
 
         actual_half_range = close * (np.exp(actual_log_range) - 1) / 2
@@ -239,23 +249,49 @@ def run_backtest() -> dict:
         premium_pts = row["premium_pts"]
         max_loss_pts = row["max_loss_pts"]
 
-        # Track individual breaches
+        # 1. Apply Entry Slippage
+        # Net premium received is lower than theoretical mid-price
+        entry_premium_net = apply_slippage(premium_pts, num_legs=4, slippage_per_leg=SLIPPAGE_ENTRY)
+
+        # 2. Simulate Outcome with 3x Stop Loss
         breach_up = actual_high > row["short_call"]
         breach_down = actual_low < row["short_put"]
+        won = not (breach_up or breach_down)
 
-        won = (actual_low >= row["short_put"]) and (actual_high <= row["short_call"])
-        pnl = premium_pts if won else -max_loss_pts
+        if won:
+            # Full premium collected (minus entry slippage)
+            gross_pnl = entry_premium_net
+        else:
+            # Implementation of 3x Stop Loss
+            # Total loss = (Entry Net Premium) - (3 * Theoretical Entry Premium)
+            # This reflects exiting when the leg price triples
+            gross_pnl = entry_premium_net - (SL_MULTIPLIER * premium_pts)
+            # Cap loss at wing width if SL is wider than wings (rare for 3x)
+            gross_pnl = max(gross_pnl, -max_loss_pts - (4 * SLIPPAGE_EXIT))
 
-        pnl_list.append(pnl)
+        # 3. Apply NSE Transaction Costs
+        # Entry charges (Sell side)
+        entry_charges = calculate_nse_charges(premium_pts, num_legs=4, is_sell=True)
+        # Exit charges (Buy side or expiry settlement)
+        exit_charges = calculate_nse_charges(premium_pts if not won else 0, num_legs=4, is_sell=False)
+        
+        total_charges_pts = entry_charges["cost_per_lot_pts"] + exit_charges["cost_per_lot_pts"]
+        net_pnl = gross_pnl - total_charges_pts - (4 * SLIPPAGE_EXIT) # Exit slippage
+
+        pnl_gross_list.append(gross_pnl)
+        pnl_net_list.append(net_pnl)
         won_list.append(won)
         breach_up_list.append(breach_up)
         breach_down_list.append(breach_down)
+        costs_list.append(total_charges_pts)
 
-    results["pnl_points"] = pnl_list
+    results["pnl_points"] = pnl_net_list # We prioritize NET results now
+    results["pnl_gross"] = pnl_gross_list
     results["won"] = won_list
     results["breach_up"] = breach_up_list
     results["breach_down"] = breach_down_list
     results["pnl_inr"] = results["pnl_points"] * LOT_SIZE
+    results["txn_costs_pts"] = costs_list
 
     # Drop weeks where actual_log_range was unavailable
     valid = results.dropna(subset=["pnl_points"])
@@ -337,6 +373,9 @@ def run_backtest() -> dict:
         "breach_rate_down_pct": round(float(breach_rate_down), 2),
         "skew_imbalance_pct": round(float(skew_imbalance), 2),
         "recommended_put_skew_pts": int(recommended_put_skew),
+        "avg_txn_cost_pts":     round(float(valid["txn_costs_pts"].mean()), 2),
+        "gross_expectancy_pts": round(float(valid["pnl_gross"].mean()), 2),
+        "net_expectancy_pts":   round(float(expectancy), 2),
     }
 
     logger.info(f"Backtest summary: {summary}")

@@ -147,9 +147,32 @@ M7: run_backtest()
        ├─ outputs/backtest_results.csv (per-week details)
        ├─ outputs/backtest_equity_curve.png (P&L + POP overlay)
        └─ outputs/backtest_summary.json (summary metrics)
-```
+    ```
 
-### Live Mode: M1→M8
+    ### Module 9: Credit Spread Generator (`module9_spreads.py`)
+
+    **Public API:**
+
+    ```python
+    def get_nse_expiries(today: date) -> list[dict]
+    Input: Today's date
+    Output: List of 3 expiry dicts {date, dte, type}
+
+    def estimate_bs_price(S, K, T, sigma, r, type) -> float
+    Input: Spot, Strike, Time (yrs), Vol (ann), Rate, Type
+    Output: Theoretical option price
+
+    def detect_direction(feature_row: pd.Series) -> dict
+    Input: Feature row
+    Output: {direction, confidence, composite, signals}
+
+    def generate_all_spreads(feature_row, spot, vix, garch_vol) -> dict
+    Input: Feature row and market data
+    Output: JSON-serializable dict with multi-expiry candidates
+    ```
+
+    ## Configuration Management
+
 
 ```
 M8: run_live_pipeline()
@@ -173,6 +196,30 @@ M8: run_live_pipeline()
        ├─ Console: formatted table (spot, strikes, VIX, buffer, POP)
        └─ JSON: outputs/strikes_live.json (full details)
 ```
+
+### Credit Spread Generator (M9)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Module 9: Credit Spread Generation System                   │
+│                                                             │
+│ ├─ NSE Expiry Calc (Weekly/Monthly)                         │
+│ ├─ Black-Scholes Premium Estimation                         │
+│ ├─ Direction Detection (Momentum + VIX Trend)               │
+│ ├─ DTE-Aware Buffer & Wing Scaling                          │
+│ └─ EV-based Spread Ranking                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**M9: generate_all_spreads()**
+- **Input**: Feature row, spot, VIX, GARCH vol.
+- **Process**:
+  1. Calculate upcoming 3 expiries (NSE Thursdays).
+  2. Detect direction signal from `prev_week_gap` and `vix_change_1w`.
+  3. Predict price range for each expiry (DTE scaled).
+  4. Estimate theoretical premiums via Black-Scholes.
+  5. Rank spreads by `EV = R:R * POP`.
+- **Output**: `outputs/spreads_live.json` with multi-expiry candidates.
 
 ## Module Interfaces
 

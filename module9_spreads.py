@@ -2,6 +2,11 @@
 Module 9: Credit Spread Generation System
 Implements bull put and bear call credit spreads across multiple expiries (weekly, monthly).
 Includes Black-Scholes premium estimation and direction signal detection.
+
+Usage:
+    from module9_spreads import generate_all_spreads
+    results = generate_all_spreads(feature_row, spot, vix_level, garch_vol)
+    # Outputs to outputs/spreads_live.json
 """
 
 import os
@@ -26,9 +31,25 @@ BASE_DIR = Path(__file__).parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
+NSE_HOLIDAYS: set[date] = {
+    # 2025
+    date(2025, 3, 8),   date(2025, 4, 11),  date(2025, 4, 14),
+    date(2025, 8, 15),  date(2025, 10, 2),  date(2025, 10, 20),
+    date(2025, 10, 21), date(2025, 11, 5),  date(2025, 12, 25),
+    # 2026
+    date(2026, 1, 1),   date(2026, 3, 26),  date(2026, 4, 3),
+    date(2026, 4, 14),  date(2026, 8, 15),  date(2026, 10, 2),
+}
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _adjust_for_holiday(d: date) -> date:
+    """If date is NSE holiday or weekend, move to previous trading day."""
+    while d in NSE_HOLIDAYS or d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
 
 def _safe_get(row, col, default):
     """Safely get a value from a pandas Series."""
@@ -70,8 +91,6 @@ def get_nse_expiries(today: date) -> list[dict]:
         # If today is Fri/Sat/Sun, it will find next Thu correctly
         # (3 - 4)%7 = 6 (Fri -> Thu), (3 - 6)%7 = 4 (Sun -> Thu)
         expiry_1 = today + timedelta(days=days_ahead)
-        if expiry_1 == today: # Should not happen with modulo unless today is Thu
-             pass
 
     # Expiry 2: 7 days after expiry 1
     expiry_2 = expiry_1 + timedelta(days=7)
@@ -81,7 +100,7 @@ def get_nse_expiries(today: date) -> list[dict]:
     next_year = expiry_2.year + (1 if expiry_2.month == 12 else 0)
     expiry_3 = _last_thursday_of_month(next_year, next_month)
 
-    expiries = [expiry_1, expiry_2, expiry_3]
+    expiries = [_adjust_for_holiday(d) for d in [expiry_1, expiry_2, expiry_3]]
     results = []
     for d in expiries:
         dte = (d - today).days
@@ -99,12 +118,9 @@ def get_nse_expiries(today: date) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def estimate_bs_price(
-    S: float,
-    K: float,
-    T_years: float,
-    sigma_annual: float,
-    r: float = 0.065,
-    option_type: str = 'put'
+    S: float, K: float, T_years: float, sigma_annual: float,
+    r: float = 0.065, option_type: str = 'put',
+    q: float = 0.015,    # ADD: Nifty dividend yield
 ) -> float:
     """Estimate theoretical option price using Black-Scholes."""
     # Guard: at expiry or beyond
@@ -117,14 +133,14 @@ def estimate_bs_price(
         sigma_annual = 0.10
     
     # Compute d1, d2
-    d1 = (np.log(S / K) + (r + 0.5 * sigma_annual**2) * T_years) / (sigma_annual * np.sqrt(T_years))
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma_annual**2) * T_years) / (sigma_annual * np.sqrt(T_years))
     d2 = d1 - sigma_annual * np.sqrt(T_years)
     
     # Black-Scholes pricing
     if option_type == 'call':
-        price = S * norm.cdf(d1) - K * np.exp(-r * T_years) * norm.cdf(d2)
+        price = S * np.exp(-q * T_years) * norm.cdf(d1) - K * np.exp(-r * T_years) * norm.cdf(d2)
     else:  # put
-        price = K * np.exp(-r * T_years) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        price = K * np.exp(-r * T_years) * norm.cdf(-d2) - S * np.exp(-q * T_years) * norm.cdf(-d1)
     
     return max(price, 0.0)
 
@@ -135,19 +151,20 @@ def estimate_spread_premium(
     T_years: float,
     sigma_annual: float,
     r: float = 0.065,
-    spread_type: str = 'bull_put'
+    spread_type: str = 'bull_put',
+    q: float = 0.015,
 ) -> dict:
     """Estimate net credit and metrics for a bull put or bear call spread."""
     if spread_type == 'bull_put':
         # Bull put: sell short_K, buy long_K (long_K < short_K)
-        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'put')
-        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'put')
+        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'put', q)
+        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'put', q)
         premium_pts = short_price - long_price
         wing_width  = short_K - long_K
     else:  # bear_call
         # Bear call: sell short_K, buy long_K (long_K > short_K)
-        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'call')
-        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'call')
+        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'call', q)
+        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'call', q)
         premium_pts = short_price - long_price
         wing_width  = long_K - short_K
     
@@ -231,11 +248,12 @@ def generate_credit_spread(
     vix_level: float,
     garch_vol: float | None,
     direction: str,  # 'bull_put' or 'bear_call'
-    r: float = 0.065
+    r: float = 0.065,
+    q: float = 0.015,
 ) -> dict:
     """Generate bull put or bear call strikes for a given expiry."""
     # Step 1: DTE Scaling Factor
-    # Weekly (5 DTE) is baseline
+    # sqrt(DTE/5): wider buffer/wing for longer-dated spreads (more time to breach)
     dte_scalar = np.sqrt(max(dte_days, 1) / 5.0)
 
     # Step 2: Half-ranges in points
@@ -284,7 +302,7 @@ def generate_credit_spread(
     T_years = dte_days / 365.0
     sigma_annual = vix_level / 100.0
     metrics = estimate_spread_premium(
-        spot, short_strike, long_strike, T_years, sigma_annual, r, direction
+        spot, short_strike, long_strike, T_years, sigma_annual, r, direction, q
     )
 
     # Step 9: Return
@@ -312,12 +330,15 @@ def generate_all_spreads(
     spot: float,
     vix_level: float,
     garch_vol: float | None,
-    r: float | None = None
+    r: float | None = None,
+    q: float | None = None,
 ) -> dict:
     """Orchestrate spread generation for 3 expiries."""
+    load_dotenv(dotenv_path=BASE_DIR / ".env")
     if r is None:
-        load_dotenv(dotenv_path=BASE_DIR / ".env")
         r = float(os.getenv("RISK_FREE_RATE", 0.065))
+    if q is None:
+        q = float(os.getenv("DIVIDEND_YIELD", 0.015))
     
     # Step 1: Predict Range
     range_pred = predict_range(feature_row)
@@ -327,14 +348,10 @@ def generate_all_spreads(
     
     # Step 3: Get Direction
     direction_result = detect_direction(feature_row)
-    direction = direction_result["direction"]
     
-    if direction == "bull":
-        spread_types = ["bull_put"]
-    elif direction == "bear":
-        spread_types = ["bear_call"]
-    else:
-        spread_types = ["bull_put", "bear_call"]
+    # Always generate both types for all expiries to provide a full market view,
+    # regardless of the directional "opinion".
+    spread_types = ["bull_put", "bear_call"]
     
     # Step 4: Generate
     all_spreads = []
@@ -349,7 +366,8 @@ def generate_all_spreads(
                     vix_level=vix_level,
                     garch_vol=garch_vol,
                     direction=s_type,
-                    r=r
+                    r=r,
+                    q=q
                 )
                 
                 spread["expiry_date"] = exp_dict["date"].isoformat()
@@ -361,7 +379,7 @@ def generate_all_spreads(
                 
                 # Min RR check
                 min_rr = float(os.getenv("MIN_RR_RATIO", 0.15))
-                spread["meets_min_rr"] = spread["rr_ratio"] >= min_rr
+                spread["meets_min_rr"] = bool(spread["rr_ratio"] >= min_rr)
                 
                 all_spreads.append(spread)
             except Exception as e:
