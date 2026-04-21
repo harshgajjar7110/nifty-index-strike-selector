@@ -1,0 +1,28 @@
+# Data (no API key required)
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.25.0
+requests>=2.31.0
+pyarrow>=14.0.0
+
+# GARCH / Statistical Volatility
+arch>=6.3.0
+scipy>=1.11.0
+statsmodels>=0.14.0
+
+# ML Models
+lightgbm>=4.3.0
+scikit-learn>=1.4.0
+shap>=0.44.0
+
+# Conformal Prediction (calibrated intervals)
+MAPIE>=0.8.0
+
+# Scheduling & Utils
+schedule>=1.2.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+joblib>=1.3.0
+
+# Visualization (optional backtesting dashboard)
+plotly>=5.20.0

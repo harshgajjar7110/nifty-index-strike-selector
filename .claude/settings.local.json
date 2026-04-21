@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__tradingview__yahoo_price",
+      "Bash(venv/Scripts/python.exe *)",
+      "Bash(venv/Scripts/python module3_garch.py)",
+      "Bash(venv/Scripts/python module1_data_pipeline.py)",
+      "Bash(python -c \"from mapie.regression import MapieQuantileRegressor; print\\('MapieQuantileRegressor OK'\\)\")",
+      "Bash(python -c \"import mapie; print\\(mapie.__version__\\)\")",
+      "Bash(venv/Scripts/pip install *)",
+      "Bash(venv/Scripts/python *)",
+      "Bash(python3 *)",
+      "Bash(/c/Users/harsh_ashokbhai/Documents/GitHub/research/venv/Scripts/python.exe *)",
+      "Bash(python -m py_compile module6_strikes.py module7_backtest.py)",
+      "Bash(python -m pytest module7_backtest.py -v)",
+      "Bash(python module7_backtest.py)",
+      "Bash(python *)",
+      "Bash(tee backtest_run.log)",
+      "Bash(tee backtest_task4.log)",
+      "Bash(tee backtest_output.log)"
+    ]
+  }
+}
