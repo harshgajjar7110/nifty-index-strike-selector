@@ -17,7 +17,9 @@
       "Bash(python *)",
       "Bash(tee backtest_run.log)",
       "Bash(tee backtest_task4.log)",
-      "Bash(tee backtest_output.log)"
+      "Bash(tee backtest_output.log)",
+      "Bash(git config *)",
+      "Bash(git commit -m 'feat: nifty 50 iron condor + credit spread engine with VIX scaling *)"
     ]
   }
 }

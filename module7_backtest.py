@@ -35,7 +35,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from module6_strikes import predict_range, generate_strikes, _load_config  # noqa: E402
-from module10_nse_costs import calculate_nse_charges, apply_slippage
+from module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
 
 # ---------------------------------------------------------------------------
 # Load configuration from module6 and environment
@@ -181,12 +181,17 @@ def run_backtest() -> dict:
             garch_vol_weekly=garch_vol,
         )
 
-        # Compute per-row premium scaled by VIX
         vix_used = vix_level if not np.isnan(vix_level) else VIX_BASELINE
-        premium_pts = int(PREMIUM_POINTS_BASE * (vix_used / VIX_BASELINE))
-        premium_pts = max(60, min(120, premium_pts))  # clamp [60, 120]
-        wing_width_used = strikes.get("wing_width_pts", 200)  # from result dict
-        max_loss_pts = wing_width_used - premium_pts
+        bs_premium = estimate_ic_premium(
+            spot=current_close,
+            short_put=strikes["short_put"], long_put=strikes["long_put"],
+            short_call=strikes["short_call"], long_call=strikes["long_call"],
+            dte_days=5,
+            vix_level=vix_used,
+        )
+        premium_pts = max(bs_premium, 5.0)
+        wing_width_used = strikes.get("wing_width_pts", 200)
+        max_loss_pts = max(wing_width_used - premium_pts, 1.0)
 
         records.append({
             "week_end": week_end,
