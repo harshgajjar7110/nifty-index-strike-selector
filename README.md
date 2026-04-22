@@ -1,6 +1,6 @@
 # Nifty 50 Iron Condor Strategy Engine
 
-ML-powered system for **conservative strike placement** in weekly/short-duration iron condor options trading on Nifty 50 (Indian stock index). Uses LightGBM quantile models + GARCH volatility + conformal prediction for **calibrated probability guarantees**.
+ML-powered system for **conservative strike placement** in weekly/short-duration iron condor options trading on Nifty 50 (Indian stock index). Uses NGBoost regime models + GARCH volatility + conformal prediction for **calibrated probability guarantees**.
 
 ## Quick Start
 
@@ -43,8 +43,8 @@ Feature Engineering (M2)
     ↓ (ATR, volatility, Bollinger Bands, range)
 GARCH Volatility (M3)
     ↓ (conditional σ(t) weekly)
-LightGBM P10/P90 Models (M4)
-    ↓ (quantile regressors, 80/20 train/test split)
+NGBoost Regime Models (M4)
+    ↓ (per-VIX-regime: low/mid/high, Normal distribution, 80/20 train/test split)
 Conformal Calibration (M5)
     ↓ (MAPIE empirical coverage guarantee)
 Strike Generation (M6) ←→ Backtester (M7)
@@ -149,14 +149,25 @@ If win rate < 65% → increase STRIKE_BUFFER_POINTS or WING_WIDTH_POINTS
    short_call = round_to_50(spot + half_range_p90 + effective_buffer)  [no skew]
    ```
 
-4. **Breach Probability (if GARCH vol available):**
+4. **Breach Probability (via NGBoost regime model):**
+   
+   NGBoost outputs (μ, σ) for weekly log-range from regime-specific Normal distribution.
    ```
-   z_call = ln(short_call / spot) / garch_vol_weekly
-   z_put = ln(spot / short_put) / garch_vol_weekly
-   breach_prob_call = 1 - Φ(z_call)
-   breach_prob_put = Φ(-z_put)
+   # Convert strike to log-range threshold
+   half_range_needed = (strike - spot) / spot
+   log_range_needed = ln(1.0 + 2.0 * half_range_needed)
+   
+   # Probability of breach
+   breach_prob_call = 1 - Φ((log_range_needed - μ) / σ)
+   breach_prob_put = Φ((-log_range_needed - μ) / σ)
    prob_of_profit = 1 - breach_prob_call - breach_prob_put
+   
+   # CVaR (tail risk at 95%/99%)
+   cvar_95 = μ + σ * φ(z_0.05) / 0.05
+   cvar_99 = μ + σ * φ(z_0.01) / 0.01
    ```
+   
+   Regime assignment: low (VIX<15) / mid (15≤VIX<20) / high (VIX≥20).
 
 **Output:** JSON with strikes, predicted range, VIX-aware metrics, breach probabilities
 
@@ -170,8 +181,10 @@ If win rate < 65% → increase STRIKE_BUFFER_POINTS or WING_WIDTH_POINTS
 | `data/nifty_intraday.parquet` | OHLCV | 1h bars (~730 days) |
 | `data/feature_matrix.parquet` | features | Engineered features per week |
 | `data/feature_matrix_with_garch.parquet` | +σ | With GARCH conditional volatility |
-| `models/lgbm_p10.pkl` | serialized | P10 quantile model |
-| `models/lgbm_p90.pkl` | serialized | P90 quantile model |
+| `models/ngb_low.pkl` | serialized | NGBoost model (VIX < 15) |
+| `models/ngb_mid.pkl` | serialized | NGBoost model (15 ≤ VIX < 20) |
+| `models/ngb_high.pkl` | serialized | NGBoost model (VIX ≥ 20) |
+| `models/regime_model_meta.json` | metadata | Model sources & training sizes per regime |
 | `models/feature_columns.pkl` | list | Feature names (training) |
 | `models/mapie_calibrated.pkl` | serialized | Conformal calibrator (MAPIE) |
 
@@ -181,7 +194,8 @@ If win rate < 65% → increase STRIKE_BUFFER_POINTS or WING_WIDTH_POINTS
 - **`module1_data_pipeline.py`** — Fetch & aggregate OHLCV (yfinance)
 - **`module2_features.py`** — Feature engineering (ATR, volatility, VIX, calendar)
 - **`module3_garch.py`** — GARCH(1,1) conditional volatility
-- **`module4_model.py`** — LightGBM P10/P90 quantile training
+- **`module4_model.py`** — NGBoost regime models (low/mid/high VIX) with Normal distribution output
+- **`module4b_risk.py`** — Risk calculations (breach_probability, CVaR, per-regime stats)
 - **`module5_calibration.py`** — MAPIE conformal calibration
 - **`module6_strikes.py`** — Strike generation logic (core)
 - **`module7_backtest.py`** — Walk-forward P&L simulation
@@ -199,7 +213,7 @@ pip install -r requirements.txt
 **Key Dependencies:**
 - `pandas`, `numpy`, `pyarrow` — data handling
 - `arch`, `scipy`, `statsmodels` — GARCH, statistics
-- `lightgbm`, `scikit-learn`, `shap` — ML + explainability
+- `ngboost`, `scikit-learn`, `shap` — ML (regime-aware boosting + explainability)
 - `MAPIE` — conformal prediction
 - `yfinance` — free market data (no API key)
 - `python-dotenv`, `loguru` — config + logging
@@ -307,7 +321,7 @@ Target metrics:
 
 ⚠️ **Market Risk** — Options trading has unlimited downside (short calls) or near-total loss (short puts + wide gaps). Position sizing critical.
 
-⚠️ **Model Risk** — GARCH assumes normal distribution; tails fatter in real markets. Breach probability underestimates tail risk.
+⚠️ **Model Risk** — NGBoost assumes Normal distribution for weekly log-range; real market tails fatter. CVaR 95%/99% provide tail risk estimates but may underestimate in extreme regimes (VIX spikes, earnings gaps).
 
 ## License
 
