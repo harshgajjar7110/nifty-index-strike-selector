@@ -36,6 +36,7 @@ if str(BASE_DIR) not in sys.path:
 
 from module6_strikes import predict_range, generate_strikes, _load_config  # noqa: E402
 from module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
+from module4b_risk import cvar  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Load configuration from module6 and environment
@@ -157,6 +158,9 @@ def run_backtest() -> dict:
         range_pred = predict_range(feature_row)
         log_range_p10 = range_pred["log_range_p10"]
         log_range_p90 = range_pred["log_range_p90"]
+        log_range_mu = range_pred.get("log_range_mu")
+        log_range_sigma = range_pred.get("log_range_sigma")
+        regime = range_pred.get("regime", "unknown")
 
         # Generate strikes (with VIX level if available)
         vix_level: float = np.nan
@@ -179,6 +183,8 @@ def run_backtest() -> dict:
             log_range_p90,
             vix_level=vix_level if not np.isnan(vix_level) else None,
             garch_vol_weekly=garch_vol,
+            log_range_mu=log_range_mu,
+            log_range_sigma=log_range_sigma,
         )
 
         vix_used = vix_level if not np.isnan(vix_level) else VIX_BASELINE
@@ -193,6 +199,9 @@ def run_backtest() -> dict:
         wing_width_used = strikes.get("wing_width_pts", 200)
         max_loss_pts = max(wing_width_used - premium_pts, 1.0)
 
+        cvar_95 = cvar(float(log_range_mu), float(log_range_sigma), 0.05) if log_range_mu and log_range_sigma else None
+        cvar_99 = cvar(float(log_range_mu), float(log_range_sigma), 0.01) if log_range_mu and log_range_sigma else None
+
         records.append({
             "week_end": week_end,
             "current_close": current_close,
@@ -202,6 +211,11 @@ def run_backtest() -> dict:
             "long_call": strikes["long_call"],
             "log_range_p10": log_range_p10,
             "log_range_p90": log_range_p90,
+            "log_range_mu": log_range_mu,
+            "log_range_sigma": log_range_sigma,
+            "regime": regime,
+            "cvar_95": cvar_95,
+            "cvar_99": cvar_99,
             "actual_log_range": actual_log_range,
             "vix_level": vix_level,
             "premium_pts": premium_pts,
@@ -323,6 +337,7 @@ def run_backtest() -> dict:
 
     # Breach rate by VIX regime
     regime_stats: dict = {}
+    cvar_stats: dict = {}
     for regime in ("low", "mid", "high"):
         mask = valid["vix_level"].apply(
             lambda v: _vix_regime(v) == regime if not np.isnan(v) else False
@@ -330,9 +345,15 @@ def run_backtest() -> dict:
         subset = valid[mask]
         if len(subset) > 0:
             breach_rate = float((subset["won"] == False).sum() / len(subset) * 100)  # noqa: E712
+            cvar_95_mean = float(subset["cvar_95"].mean()) if "cvar_95" in subset.columns else None
+            cvar_99_mean = float(subset["cvar_99"].mean()) if "cvar_99" in subset.columns else None
         else:
             breach_rate = np.nan
+            cvar_95_mean = None
+            cvar_99_mean = None
         regime_stats[f"breach_rate_{regime}_vix_pct"] = round(breach_rate, 2) if not np.isnan(breach_rate) else None
+        cvar_stats[f"cvar_95_{regime}"] = round(cvar_95_mean, 4) if cvar_95_mean is not None else None
+        cvar_stats[f"cvar_99_{regime}"] = round(cvar_99_mean, 4) if cvar_99_mean is not None else None
 
     # Compute premium statistics
     premium_stats = {
@@ -369,6 +390,7 @@ def run_backtest() -> dict:
         "sharpe_ratio": round(sharpe, 4),
         "expectancy_per_trade_points": round(expectancy, 4),
         **regime_stats,
+        **cvar_stats,
         "premium_points_base": PREMIUM_POINTS_BASE,
         "wing_width_points": "dynamic (see backtest_results.csv column 'wing_width_pts')",
         **premium_stats,

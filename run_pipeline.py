@@ -44,8 +44,9 @@ def _data_exists() -> bool:
 
 def _models_exist() -> bool:
     return (
-        (BASE_DIR / "models" / "lgbm_p10.pkl").exists()
-        and (BASE_DIR / "models" / "lgbm_p90.pkl").exists()
+        (BASE_DIR / "models" / "ngb_low.pkl").exists()
+        and (BASE_DIR / "models" / "ngb_mid.pkl").exists()
+        and (BASE_DIR / "models" / "ngb_high.pkl").exists()
     )
 
 
@@ -84,12 +85,13 @@ def mode_setup():
     garch_df = run_garch_pipeline()
     logger.success(f"M3 done — {len(garch_df)} rows with GARCH features.")
 
-    # M4: Train LightGBM quantile models
-    _step("M4 — Training LightGBM P10/P90 quantile models")
+    # M4: Train NGBoost regime models
+    _step("M4 — Training NGBoost per-regime models (low/mid/high VIX)")
     from module4_model import train_models
     eval_results = train_models()
     coverage = eval_results.get("coverage_rate", 0)
-    logger.success(f"M4 done — Coverage: {coverage:.1%} | Pinball P10: {eval_results.get('pinball_p10', '?'):.4f}")
+    regime_cov = eval_results.get("regime_coverage", {})
+    logger.success(f"M4 done — Coverage: {coverage:.1%} | Per-regime: {regime_cov}")
 
     # M5: Conformal calibration
     _step("M5 — Conformal calibration (MAPIE)")

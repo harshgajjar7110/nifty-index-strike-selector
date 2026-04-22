@@ -57,60 +57,85 @@ def _safe_get(row, col, default):
         return float(row[col])
     return default
 
-def _last_thursday_of_month(year: int, month: int) -> date:
-    """Find the last Thursday of a given month and year."""
+NSE_EXPIRY_WEEKDAY = 1  # NSE Nifty 50 options expire on Tuesday (changed from Thursday ~2023)
+NIFTY_LOT_SIZE = 65    # NSE Nifty 50 lot size (as of 2024)
+
+def _last_expiry_weekday_of_month(year: int, month: int) -> date:
+    """Find the last NSE_EXPIRY_WEEKDAY of a given month."""
     last_day = monthrange(year, month)[1]
     d = date(year, month, last_day)
-    while d.weekday() != 3:  # 3 is Thursday
+    while d.weekday() != NSE_EXPIRY_WEEKDAY:
         d -= timedelta(days=1)
     return d
 
-def _is_last_thursday(d: date) -> bool:
-    """Check if date d is the last Thursday of its month."""
-    if d.weekday() != 3:
+def _is_last_expiry_weekday(d: date) -> bool:
+    """Check if d is the last expiry weekday (monthly expiry) of its month."""
+    if d.weekday() != NSE_EXPIRY_WEEKDAY:
         return False
-    next_thursday = d + timedelta(days=7)
-    return next_thursday.month != d.month
+    return (d + timedelta(days=7)).month != d.month
 
 # ---------------------------------------------------------------------------
 # T1 — NSE Expiry Calculator
 # ---------------------------------------------------------------------------
 
-def get_nse_expiries(today: date) -> list[dict]:
+def get_nse_expiries(today: date, nse_expiry_list: list[str] | None = None) -> list[dict]:
     """
     Compute upcoming Nifty options expiry dates (weekly and monthly).
-    Returns 3 expiries: next Thu, 7 days later, and the following month's last Thu.
+
+    If nse_expiry_list is provided (from live OI chain, format '28-Apr-2026'),
+    uses those exact dates — most accurate, handles any NSE schedule change.
+    Otherwise falls back to computed Tuesday-based calendar.
+
+    Returns 3 expiries: nearest, next week, next month's last expiry.
     """
-    # Expiry 1: next Thursday (or today if today is Thursday)
-    days_ahead = (3 - today.weekday()) % 7
-    # If today is Thu, days_ahead is 0, which is correct for pre-market/intraday
-    # But usually Sunday runner wants the upcoming Thu
-    if days_ahead == 0 and today.weekday() == 3:
+    # --- Path A: use actual NSE expiry dates from OI chain ---
+    if nse_expiry_list:
+        from datetime import datetime
+        parsed = []
+        for s in nse_expiry_list:
+            try:
+                parsed.append(datetime.strptime(s, "%d-%b-%Y").date())
+            except ValueError:
+                continue
+
+        future = sorted(d for d in parsed if d >= today)
+        if len(future) >= 3:
+            results = []
+            for i, d in enumerate(future[:3]):
+                dte = (d - today).days
+                results.append({
+                    "date": d,
+                    "dte": max(dte, 0),
+                    "type": "monthly" if _is_last_expiry_weekday(d) else "weekly",
+                    "source": "nse_live",
+                })
+            logger.info(f"Expiries from NSE live chain: {[r['date'].isoformat() for r in results]}")
+            return results
+
+    # --- Path B: compute Tuesday-based calendar (fallback) ---
+    days_ahead = (NSE_EXPIRY_WEEKDAY - today.weekday()) % 7
+    if days_ahead == 0 and today.weekday() == NSE_EXPIRY_WEEKDAY:
         expiry_1 = today
     else:
-        # If today is Fri/Sat/Sun, it will find next Thu correctly
-        # (3 - 4)%7 = 6 (Fri -> Thu), (3 - 6)%7 = 4 (Sun -> Thu)
         expiry_1 = today + timedelta(days=days_ahead)
 
-    # Expiry 2: 7 days after expiry 1
     expiry_2 = expiry_1 + timedelta(days=7)
 
-    # Expiry 3: Last Thursday of month AFTER expiry_2
     next_month = (expiry_2.month % 12) + 1
     next_year = expiry_2.year + (1 if expiry_2.month == 12 else 0)
-    expiry_3 = _last_thursday_of_month(next_year, next_month)
+    expiry_3 = _last_expiry_weekday_of_month(next_year, next_month)
 
     expiries = [_adjust_for_holiday(d) for d in [expiry_1, expiry_2, expiry_3]]
     results = []
     for d in expiries:
         dte = (d - today).days
-        is_monthly = _is_last_thursday(d)
         results.append({
             "date": d,
             "dte": max(dte, 0),
-            "type": "monthly" if is_monthly else "weekly"
+            "type": "monthly" if _is_last_expiry_weekday(d) else "weekly",
+            "source": "computed",
         })
-    
+    logger.info(f"Expiries computed (fallback): {[r['date'].isoformat() for r in results]}")
     return results
 
 # ---------------------------------------------------------------------------
@@ -250,6 +275,7 @@ def generate_credit_spread(
     direction: str,  # 'bull_put' or 'bear_call'
     r: float = 0.065,
     q: float = 0.015,
+    atm_iv: float | None = None,
 ) -> dict:
     """Generate bull put or bear call strikes for a given expiry."""
     # Step 1: DTE Scaling Factor
@@ -300,25 +326,28 @@ def generate_credit_spread(
 
     # Step 8: Premium and Metrics
     T_years = dte_days / 365.0
-    sigma_annual = vix_level / 100.0
+    sigma_annual = atm_iv if (atm_iv and atm_iv > 0.05) else vix_level / 100.0
     metrics = estimate_spread_premium(
         spot, short_strike, long_strike, T_years, sigma_annual, r, direction, q
     )
 
     # Step 9: Return
     return {
-        "spot":           round(spot, 2),
-        "spread_type":    direction,
-        "short_strike":   short_strike,
-        "long_strike":    long_strike,
-        "wing_width":     int(scaled_wing),
-        "scaled_buffer":  round(scaled_buffer, 2),
-        "premium_pts":    metrics["premium_pts"],
-        "max_loss_pts":   metrics["max_loss_pts"],
-        "rr_ratio":       metrics["rr_ratio"],
-        "breakeven":      metrics["breakeven"],
-        "pop_pct":        round(pop_pct, 4) if pop_pct is not None else None,
-        "dte_days":       dte_days,
+        "spot":              round(spot, 2),
+        "spread_type":       direction,
+        "short_strike":      short_strike,
+        "long_strike":       long_strike,
+        "wing_width":        int(scaled_wing),
+        "scaled_buffer":     round(scaled_buffer, 2),
+        "premium_pts":       metrics["premium_pts"],
+        "max_loss_pts":      metrics["max_loss_pts"],
+        "max_profit_inr":    round(metrics["premium_pts"]  * NIFTY_LOT_SIZE, 2),
+        "max_loss_inr":      round(metrics["max_loss_pts"] * NIFTY_LOT_SIZE, 2),
+        "rr_ratio":          metrics["rr_ratio"],
+        "breakeven":         metrics["breakeven"],
+        "pop_pct":           round(pop_pct, 4) if pop_pct is not None else None,
+        "dte_days":          dte_days,
+        "lot_size":          NIFTY_LOT_SIZE,
     }
 
 # ---------------------------------------------------------------------------
@@ -332,6 +361,7 @@ def generate_all_spreads(
     garch_vol: float | None,
     r: float | None = None,
     q: float | None = None,
+    oi_data: dict | None = None,
 ) -> dict:
     """Orchestrate spread generation for 3 expiries."""
     load_dotenv(dotenv_path=BASE_DIR / ".env")
@@ -339,16 +369,34 @@ def generate_all_spreads(
         r = float(os.getenv("RISK_FREE_RATE", 0.065))
     if q is None:
         q = float(os.getenv("DIVIDEND_YIELD", 0.015))
+
+    # Extract OI-derived inputs (all optional; None = fall back to GARCH/VIX)
+    atm_iv         = oi_data.get("atm_iv")        if oi_data else None
+    pcr            = oi_data.get("pcr")            if oi_data else None
+    oi_strikes     = {int(k): v for k, v in oi_data.get("strikes", {}).items()} if oi_data else {}
+    nse_expiry_list = oi_data.get("expiry_dates")  if oi_data else None
+    min_oi         = int(os.getenv("MIN_OI_LIQUIDITY", "5000"))
     
     # Step 1: Predict Range
     range_pred = predict_range(feature_row)
     
-    # Step 2: Get Expiries
-    expiries = get_nse_expiries(date.today())
+    # Step 2: Get Expiries — use actual NSE schedule if OI chain available
+    expiries = get_nse_expiries(date.today(), nse_expiry_list=nse_expiry_list)
     
     # Step 3: Get Direction
     direction_result = detect_direction(feature_row)
-    
+
+    # Override direction with PCR when market OI gives strong signal
+    if pcr is not None:
+        if pcr > 1.3:
+            _pcr_dir = "bull"
+        elif pcr < 0.7:
+            _pcr_dir = "bear"
+        else:
+            _pcr_dir = direction_result.get("direction", "neutral")
+        logger.info(f"PCR={pcr:.2f} → direction: {_pcr_dir}")
+        direction_result = {**direction_result, "pcr": pcr, "pcr_direction": _pcr_dir}
+
     # Always generate both types for all expiries to provide a full market view,
     # regardless of the directional "opinion".
     spread_types = ["bull_put", "bear_call"]
@@ -367,7 +415,8 @@ def generate_all_spreads(
                     garch_vol=garch_vol,
                     direction=s_type,
                     r=r,
-                    q=q
+                    q=q,
+                    atm_iv=atm_iv,
                 )
                 
                 spread["expiry_date"] = exp_dict["date"].isoformat()
@@ -387,7 +436,25 @@ def generate_all_spreads(
 
     # Step 5: Rank
     all_spreads.sort(key=lambda x: x["ev_proxy"], reverse=True)
-    
+
+    # Feasibility filter: drop spreads that don't meet min RR
+    before_rr = len(all_spreads)
+    all_spreads = [s for s in all_spreads if s["meets_min_rr"]]
+    if len(all_spreads) < before_rr:
+        logger.info(f"Min RR filter: {before_rr} → {len(all_spreads)} spreads (min_rr={os.getenv('MIN_RR_RATIO', '0.15')})")
+
+    # OI liquidity filter
+    if oi_strikes and min_oi > 0:
+        def _liquid(strike: float) -> bool:
+            k = int(round(strike / 50) * 50)
+            row = oi_strikes.get(k, {})
+            return (row.get("call_oi", 0) + row.get("put_oi", 0)) >= min_oi
+
+        before = len(all_spreads)
+        all_spreads = [s for s in all_spreads
+                       if _liquid(s["short_strike"]) and _liquid(s["long_strike"])]
+        logger.info(f"OI liquidity filter: {before} → {len(all_spreads)} spreads (min_oi={min_oi})")
+
     # Step 6: Result
     result = {
         "generated_at":     date.today().isoformat(),
@@ -396,6 +463,10 @@ def generate_all_spreads(
         "direction_signal": direction_result,
         "expiries":         [e["date"].isoformat() for e in expiries],
         "spreads":          all_spreads,
+        "oi_data_used":     oi_data is not None,
+        "oi_filtered":      bool(oi_strikes and min_oi > 0),
+        "atm_iv_pct":       round(atm_iv * 100, 2) if atm_iv else None,
+        "pcr":              pcr,
         "summary": {
             "total_spreads": len(all_spreads),
             "top_pick":      all_spreads[0] if all_spreads else None,

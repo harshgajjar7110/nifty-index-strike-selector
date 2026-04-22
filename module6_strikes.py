@@ -16,6 +16,11 @@ from dotenv import load_dotenv
 from loguru import logger
 from scipy.stats import norm
 
+try:
+    from module4b_risk import breach_probability
+except ImportError:
+    breach_probability = None
+
 # load_dotenv only needed for strike config (buffer/wing points), not for credentials
 
 # ---------------------------------------------------------------------------
@@ -33,26 +38,27 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 _MODEL_CACHE: dict = {}
 
 def _load_models():
-    """Load P10/P90 models and feature columns. Raises FileNotFoundError if missing."""
+    """Load per-regime NGBoost models and feature columns. Raises FileNotFoundError if missing."""
     if _MODEL_CACHE:
-        return _MODEL_CACHE["p10"], _MODEL_CACHE["p90"], _MODEL_CACHE["cols"]
+        return _MODEL_CACHE["ngb"], _MODEL_CACHE["cols"]
 
-    p10_path = MODELS_DIR / "lgbm_p10.pkl"
-    p90_path = MODELS_DIR / "lgbm_p90.pkl"
-    feat_path = MODELS_DIR / "feature_columns.pkl"
+    meta_path = MODELS_DIR / "regime_model_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError("Run module4_model.py first")
 
-    for path in (p10_path, p90_path, feat_path):
-        if not path.exists():
-            raise FileNotFoundError("Run module4_model.py first")
+    with open(meta_path) as f:
+        regime_meta = json.load(f)
 
-    lgbm_p10 = joblib.load(p10_path)
-    lgbm_p90 = joblib.load(p90_path)
-    feature_columns = joblib.load(feat_path)
-    logger.info("Models and feature columns loaded.")
-    _MODEL_CACHE["p10"] = lgbm_p10
-    _MODEL_CACHE["p90"] = lgbm_p90
+    ngb_models = {}
+    for regime in ["low", "mid", "high"]:
+        model_file = MODELS_DIR / regime_meta[regime]["model_file"]
+        ngb_models[regime] = joblib.load(model_file)
+
+    feature_columns = joblib.load(MODELS_DIR / "feature_columns.pkl")
+    logger.info("Regime NGBoost models and feature columns loaded.")
+    _MODEL_CACHE["ngb"] = ngb_models
     _MODEL_CACHE["cols"] = feature_columns
-    return lgbm_p10, lgbm_p90, feature_columns
+    return ngb_models, feature_columns
 
 
 _CONFIG_CACHE: dict = {}
@@ -159,25 +165,39 @@ def round_to_strike(price: float, interval: int = 50) -> int:
 
 def predict_range(feature_row: pd.Series) -> dict:
     """
-    Predict P10 and P90 log-range for a single feature row.
+    Predict P10 and P90 log-range + mu/sigma for a single feature row.
 
-    Parameters
-    ----------
-    feature_row : pd.Series
-        Features matching the training feature set.
-
-    Returns
-    -------
-    dict with keys: log_range_p10, log_range_p90
+    Returns dict with keys: log_range_p10, log_range_p90, log_range_mu, log_range_sigma, regime
     """
-    model_p10, model_p90, feature_columns = _load_models()
+    ngb_models, feature_columns = _load_models()
 
     X = feature_row[feature_columns].values.reshape(1, -1)
-    log_range_p10 = float(model_p10.predict(X)[0])
-    log_range_p90 = float(model_p90.predict(X)[0])
+    vix = float(feature_row["vix_level"])
+    regime = "low" if vix < 15 else ("mid" if vix < 20 else "high")
 
-    logger.info(f"Predicted log_range_p10={log_range_p10:.4f}, log_range_p90={log_range_p90:.4f}")
-    return {"log_range_p10": log_range_p10, "log_range_p90": log_range_p90}
+    model = ngb_models[regime]
+
+    if isinstance(model, dict):  # Linear QR fallback
+        X_const = np.concatenate([[1], X[0]])
+        log_range_p10 = float(model["qr_p10"].predict(X_const)[0])
+        log_range_p90 = float(model["qr_p90"].predict(X_const)[0])
+        log_range_mu = (log_range_p10 + log_range_p90) / 2
+        log_range_sigma = (log_range_p90 - log_range_p10) / (2 * norm.ppf(0.90))
+    else:  # NGBoost
+        dist = model.pred_dist(X)
+        log_range_mu = float(dist.params["loc"][0])
+        log_range_sigma = float(dist.params["scale"][0])
+        log_range_p10 = float(norm.ppf(0.10, loc=log_range_mu, scale=log_range_sigma))
+        log_range_p90 = float(norm.ppf(0.90, loc=log_range_mu, scale=log_range_sigma))
+
+    logger.info(f"Predicted log_range: p10={log_range_p10:.4f}, p90={log_range_p90:.4f}, mu={log_range_mu:.4f}, sigma={log_range_sigma:.4f}, regime={regime}")
+    return {
+        "log_range_p10": log_range_p10,
+        "log_range_p90": log_range_p90,
+        "log_range_mu": log_range_mu,
+        "log_range_sigma": log_range_sigma,
+        "regime": regime,
+    }
 
 
 def generate_strikes(
@@ -188,6 +208,10 @@ def generate_strikes(
     put_skew_pts: int = 0,
     call_skew_pts: int = 0,
     garch_vol_weekly: float | None = None,
+    atm_iv: float | None = None,
+    max_pain: float | None = None,
+    log_range_mu: float | None = None,
+    log_range_sigma: float | None = None,
 ) -> dict:
     """
     Convert log-range predictions and current spot into iron condor strikes.
@@ -237,7 +261,7 @@ def generate_strikes(
             vix_level = vix_baseline
 
     # Select wing width based on VIX regime
-    if vix_level < 13:
+    if vix_level < 15:
         wing_width = wing_width_config["low"]
     elif vix_level < 20:
         wing_width = wing_width_config["mid"]
@@ -283,24 +307,46 @@ def generate_strikes(
     short_put = round_to_strike(lower_price)
     short_call = round_to_strike(upper_price)
 
+    # Blend strikes 30% toward max pain (where option sellers are most hedged)
+    if max_pain is not None:
+        _MP_BLEND = 0.30
+        short_put  = short_put  + _MP_BLEND * (max_pain - short_put)
+        short_call = short_call + _MP_BLEND * (max_pain - short_call)
+        short_put  = round_to_strike(short_put)
+        short_call = round_to_strike(short_call)
+        logger.info(f"Max pain blend applied: max_pain={max_pain}, short_put→{short_put}, short_call→{short_call}")
+
     long_put = short_put - wing_width
     long_call = short_call + wing_width
 
-    # Compute breach probabilities using lognormal model
+    # Compute breach probabilities
     breach_prob_call = None
     breach_prob_put = None
     prob_of_profit = None
 
-    if garch_vol_weekly is not None and garch_vol_weekly > 0:
-        z_call = np.log(short_call / current_close) / garch_vol_weekly
-        z_put = np.log(current_close / short_put) / garch_vol_weekly
-        breach_prob_call = float(1 - norm.cdf(z_call))
-        breach_prob_put = float(norm.cdf(-z_put))
+    if breach_probability and log_range_mu is not None and log_range_sigma is not None and log_range_sigma > 0:
+        breach_prob_call = breach_probability(short_call, log_range_mu, log_range_sigma, current_close, "call")
+        breach_prob_put = breach_probability(short_put, log_range_mu, log_range_sigma, current_close, "put")
         prob_of_profit = float(1 - breach_prob_call - breach_prob_put)
         logger.info(
             f"POP: {prob_of_profit:.1%}, breach_call: {breach_prob_call:.1%}, "
-            f"breach_put: {breach_prob_put:.1%}"
+            f"breach_put: {breach_prob_put:.1%}  [src=ngboost_dist]"
         )
+    else:
+        # Fallback: lognormal model using GARCH/ATM IV
+        atm_iv_weekly = atm_iv * np.sqrt(5 / 252) if (atm_iv and atm_iv > 0) else None
+        vol_for_pop = atm_iv_weekly if atm_iv_weekly else garch_vol_weekly
+        if vol_for_pop is not None and vol_for_pop > 0:
+            z_call = np.log(short_call / current_close) / vol_for_pop
+            z_put  = np.log(current_close / short_put)  / vol_for_pop
+            breach_prob_call = float(1 - norm.cdf(z_call))
+            breach_prob_put  = float(norm.cdf(-z_put))
+            prob_of_profit   = float(1 - breach_prob_call - breach_prob_put)
+            vol_src = "market_iv" if (atm_iv and atm_iv > 0) else "garch"
+            logger.info(
+                f"POP: {prob_of_profit:.1%}, breach_call: {breach_prob_call:.1%}, "
+                f"breach_put: {breach_prob_put:.1%}  [vol_src={vol_src}]"
+            )
 
     result = {
         "current_close": current_close,
@@ -321,6 +367,8 @@ def generate_strikes(
         "breach_prob_call": breach_prob_call,
         "breach_prob_put": breach_prob_put,
         "prob_of_profit": prob_of_profit,
+        "atm_iv_used":   round(atm_iv * 100, 2) if atm_iv else None,
+        "max_pain_used": int(max_pain) if max_pain else None,
     }
 
     if put_skew_pts > 0:

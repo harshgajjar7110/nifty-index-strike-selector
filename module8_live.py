@@ -1,7 +1,7 @@
 """
 Module 8: Live Sunday-Night Orchestration
 Run before each weekly expiry to fetch latest data, rebuild features/GARCH,
-and generate iron condor strike recommendations.
+and generate credit spread recommendations (bull put / bear call).
 
 Usage:
     # Run every Sunday before market open:
@@ -23,7 +23,7 @@ sys.path.insert(0, str(BASE_DIR))
 OUTPUTS_DIR = BASE_DIR / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-STRIKES_JSON = OUTPUTS_DIR / "strikes_live.json"
+SPREADS_JSON = OUTPUTS_DIR / "spreads_live.json"
 FEATURE_PARQUET = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
 
 
@@ -31,58 +31,40 @@ FEATURE_PARQUET = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
-def _fmt(value: float) -> str:
-    """Format a float as a comma-separated integer string."""
-    return f"{int(round(value)):,}"
+def _print_spreads(spreads_result: dict, week_date: str) -> None:
+    """Print credit spread recommendations to stdout."""
+    spreads = spreads_result.get("spreads", [])
+    spot    = spreads_result.get("spot", 0)
+    vix     = spreads_result.get("vix_level", 0)
+    atm_iv  = spreads_result.get("atm_iv_pct")
+    pcr     = spreads_result.get("pcr")
+    dir_sig = spreads_result.get("direction_signal", {})
 
-
-def _print_table(strikes: dict, week_date: str) -> None:
-    """Print a formatted iron condor summary table to stdout."""
-    spot = strikes["current_close"]
-    short_put = strikes["short_put"]
-    short_call = strikes["short_call"]
-    long_put = strikes["long_put"]
-    long_call = strikes["long_call"]
-    p10 = strikes["predicted_range_p10"]
-    p90 = strikes["predicted_range_p90"]
-    buffer_pts = strikes["buffer_pts"]
-    effective_buffer = strikes.get("effective_buffer_pts", buffer_pts)
-    wing_width = strikes["wing_width_pts"]
-    vix_level = strikes.get("vix_level", "?")
-    vix_baseline = strikes.get("vix_baseline", "?")
-    put_skew_pts = strikes.get("put_skew_pts", 0)
-
-    sep = "=" * 43
-    thin = "-" * 43
+    sep  = "=" * 60
+    thin = "-" * 60
 
     print(sep)
-    print(f"     NIFTY IRON CONDOR — WEEK OF {week_date}")
+    print(f"  NIFTY CREDIT SPREADS — {week_date}")
     print(sep)
-    print(f"Nifty Spot        :  {_fmt(spot)}")
-    print(f"Short PUT strike  :  {_fmt(short_put)}")
-    print(f"Short CALL strike :  {_fmt(short_call)}")
-    print(f"Long  PUT  strike :  {_fmt(long_put)}  (wing)")
-    print(f"Long  CALL strike :  {_fmt(long_call)}  (wing)")
+    print(f"  Spot: {spot:,.0f}  |  VIX: {vix:.1f}  |  ATM IV: {f'{atm_iv:.2f}%' if atm_iv else 'N/A'}  |  PCR: {f'{pcr:.2f}' if pcr else 'N/A'}")
+    print(f"  Direction: {dir_sig.get('direction','?').upper()}  (confidence: {dir_sig.get('confidence',0):.2f})")
     print(thin)
-    print(f"Predicted range   :  {int(round(p10))} - {int(round(p90))} pts (P10-P90)")
-    vix_str = vix_level if isinstance(vix_level, str) else f"{vix_level:.1f}"
-    vix_base_str = vix_baseline if isinstance(vix_baseline, str) else f"{vix_baseline:.1f}"
-    print(f"Current VIX       :  {vix_str}  (baseline: {vix_base_str})")
-    print(f"Buffer applied    :  {int(buffer_pts)} pts -> {int(effective_buffer)} pts (VIX-scaled)")
-    if put_skew_pts > 0:
-        print(f"Put skew applied  :  {int(put_skew_pts)} pts")
-    call_skew_pts = strikes.get("call_skew_pts", 0)
-    if call_skew_pts > 0:
-        print(f"Call skew applied :  {int(call_skew_pts)} pts")
-    print(f"Wing width        :  {int(wing_width)} pts")
 
-    # Display probability of profit if available
-    pop_pct = strikes.get("prob_of_profit")
-    bc_pct = strikes.get("breach_prob_call")
-    bp_pct = strikes.get("breach_prob_put")
+    if not spreads:
+        print("  No feasible spreads found (all below min R:R or OI threshold).")
+        print(sep)
+        return
 
-    if pop_pct is not None:
-        print(f"Prob of Profit    :  {pop_pct*100:.1f}%  (call {bc_pct*100:.1f}% / put {bp_pct*100:.1f}% breach)")
+    for s in spreads:
+        stype = "Bull Put " if s["spread_type"] == "bull_put" else "Bear Call"
+        pop   = s.get("pop_pct") or 0
+        print(f"  {stype}  {int(s['short_strike'])}/{int(s['long_strike'])}"
+              f"  |  Expiry: {s['expiry_date']} ({s['expiry_type']})  DTE={s['dte_days']}d")
+        print(f"    Max Profit: {s['premium_pts']:.1f} pts  (₹{s['max_profit_inr']:,.0f})"
+              f"  |  Max Loss: {s['max_loss_pts']:.1f} pts  (₹{s['max_loss_inr']:,.0f})")
+        print(f"    R:R: {s['rr_ratio']:.2%}  |  POP: {pop*100:.1f}%"
+              f"  |  Breakeven: {s['breakeven']:.0f}  |  EV: {s.get('ev_proxy',0):.4f}")
+        print()
     print(sep)
 
 
@@ -96,11 +78,11 @@ def run_live_pipeline() -> dict:
 
     Returns
     -------
-    dict — strike recommendations (also written to outputs/strikes_live.json)
+    dict — spread recommendations (also written to outputs/spreads_live.json)
     """
     import pandas as pd
 
-    strikes: dict = {}
+    spreads_result: dict = {}
     step = "initialisation"
 
     try:
@@ -180,85 +162,49 @@ def run_live_pipeline() -> dict:
         logger.info(f"Live Nifty spot: {spot:,.2f}")
 
         # ------------------------------------------------------------------
-        # Step 6 — Generate strikes
+        # Step 5.5 — NSE Option Chain OI (non-blocking)
         # ------------------------------------------------------------------
-        step = "predict range & generate strikes (module6)"
-        logger.info(f"[Step 6] {step}")
-        from module6_strikes import predict_range, generate_strikes, _load_config
-
-        # Load put_skew_pts and call_skew_pts from config (single source of truth)
-        _, _, _, put_skew_pts, _, call_skew_pts = _load_config()
-
-        range_pred = predict_range(feature_row)
-        strikes = generate_strikes(
-            spot,
-            range_pred["log_range_p10"],
-            range_pred["log_range_p90"],
-            vix_level=vix_level,
-            put_skew_pts=put_skew_pts,
-            call_skew_pts=call_skew_pts,
-            garch_vol_weekly=garch_vol,
-        )
-
-        # ------------------------------------------------------------------
-        # Step 7 — Output
-        # ------------------------------------------------------------------
-        step = "output"
-        week_label = date.today().isoformat()
-        strikes["week_of"] = week_label
-
-        # Console table
-        _print_table(strikes, week_label)
-
-        # JSON file
-        with open(STRIKES_JSON, "w") as fh:
-            json.dump(strikes, fh, indent=2)
-        logger.success(f"Strikes saved to {STRIKES_JSON}")
+        step = "option chain fetch (module11)"
+        logger.info(f"[Step 5.5] {step}")
+        oi_data = None
+        try:
+            from module11_option_chain import fetch_option_chain
+            oi_data = fetch_option_chain()
+            if oi_data:
+                if oi_data.get("atm_iv"):
+                    logger.info(
+                        f"OI loaded: ATM IV={oi_data['atm_iv']:.1%}  "
+                        f"PCR={oi_data['pcr']:.2f}  MaxPain={oi_data['max_pain']}"
+                    )
+                else:
+                    logger.info(f"OI loaded: PCR={oi_data['pcr']:.2f}  MaxPain={oi_data['max_pain']}")
+        except Exception as e11:
+            logger.warning(f"Option chain fetch failed (non-fatal): {e11} — GARCH-only mode")
 
         # ------------------------------------------------------------------
-        # Step 8 — Credit Spreads (module9) — non-blocking additive
+        # Step 6 — Credit Spreads (module9)
         # ------------------------------------------------------------------
         step = "credit spread generation (module9)"
-        logger.info(f"{'─'*60}")
-        logger.info(f"  {step}")
-        logger.info(f"{'─'*60}")
+        logger.info(f"[Step 6] {step}")
+        from module9_spreads import generate_all_spreads
 
-        try:
-            from module9_spreads import generate_all_spreads
-            
-            spreads_result = generate_all_spreads(
-                feature_row=feature_row,
-                spot=spot,
-                vix_level=vix_level if vix_level else 16.0,
-                garch_vol=garch_vol,
-            )
-            
-            # Write output
-            SPREADS_JSON = OUTPUTS_DIR / "spreads_live.json"
-            with open(SPREADS_JSON, "w") as fh:
-                json.dump(spreads_result, fh, indent=2, default=str)
-            logger.success(f"Credit spreads → {SPREADS_JSON}")
-            
-            # Console summary
-            spreads = spreads_result.get("spreads", [])
-            top_bull = next((s for s in spreads if s["spread_type"] == "bull_put"), None)
-            top_bear = next((s for s in spreads if s["spread_type"] == "bear_call"), None)
+        week_label = date.today().isoformat()
 
-            if top_bull or top_bear:
-                print(f"\n  ★ Top Credit Spreads by Regime")
-                
-                for label, s in [("Bull Put ", top_bull), ("Bear Call", top_bear)]:
-                    if s:
-                        meets = "✓" if s.get("meets_min_rr") else "✗"
-                        print(f"    {label}:  {s['short_strike']}/{s['long_strike']} | Expiry: {s['expiry_date']} ({s['expiry_type']})")
-                        print(f"                Premium: {s['premium_pts']:.1f} pts | R:R: {s['rr_ratio']:.2%} | POP: {s.get('pop_pct', 0)*100:.1f}% | Min RR: {meets}")
-            
-        except ImportError:
-            logger.warning("module9_spreads not found — skipping credit spread generation")
-        except Exception as e9:
-            logger.warning(f"Credit spread generation failed (non-fatal): {e9}")
-            import traceback
-            traceback.print_exc()
+        spreads_result = generate_all_spreads(
+            feature_row=feature_row,
+            spot=spot,
+            vix_level=vix_level if vix_level else 16.0,
+            garch_vol=garch_vol,
+            oi_data=oi_data,
+        )
+
+        # Console table
+        _print_spreads(spreads_result, week_label)
+
+        # JSON file
+        with open(SPREADS_JSON, "w") as fh:
+            json.dump(spreads_result, fh, indent=2, default=str)
+        logger.success(f"Spreads saved to {SPREADS_JSON}")
 
     except SystemExit:
         # Propagate intentional exits (e.g. missing .env)
@@ -267,21 +213,20 @@ def run_live_pipeline() -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.error(f"Pipeline failed at step '{step}': {exc}")
 
-        # Attempt to show last known strikes
-        if STRIKES_JSON.exists():
-            logger.warning("Showing last known strikes from cache.")
+        # Attempt to show last known spreads
+        if SPREADS_JSON.exists():
+            logger.warning("Showing last known spreads from cache.")
             try:
-                with open(STRIKES_JSON) as fh:
-                    strikes = json.load(fh)
-                week_label = strikes.get("week_of", "unknown")
-                print(f"\n[WARNING] Using cached strikes from {week_label}\n")
-                _print_table(strikes, week_label)
+                with open(SPREADS_JSON) as fh:
+                    spreads_result = json.load(fh)
+                print(f"\n[WARNING] Using cached spreads from {spreads_result.get('generated_at', 'unknown')}\n")
+                _print_spreads(spreads_result, spreads_result.get("generated_at", "unknown"))
             except Exception as load_exc:
-                logger.error(f"Could not load cached strikes: {load_exc}")
+                logger.error(f"Could not load cached spreads: {load_exc}")
         else:
-            logger.error("No cached strikes available.")
+            logger.error("No cached spreads available.")
 
-    return strikes
+    return spreads_result
 
 
 if __name__ == "__main__":

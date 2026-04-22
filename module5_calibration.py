@@ -1,6 +1,6 @@
 """
 Module 5: Conformal Calibration
-Wraps P10/P90 LightGBM quantile models with MAPIE conformal prediction
+Wraps per-regime NGBoost models with MAPIE conformal prediction
 to provide guaranteed coverage bounds on predicted weekly range.
 """
 
@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from loguru import logger
 from dotenv import load_dotenv
+from scipy.stats import norm
+from sklearn.base import BaseEstimator, RegressorMixin
 
 BASE_DIR = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
@@ -20,28 +22,55 @@ OUTPUTS_DIR = BASE_DIR / "outputs"
 DATA_DIR = BASE_DIR / "data"
 
 
+class RegimeNGBoostWrapper(BaseEstimator, RegressorMixin):
+    """Route predictions by VIX regime to per-regime NGBoost models."""
+
+    def __init__(self, ngb_models: dict, feature_columns: list):
+        self.ngb_models = ngb_models
+        self.feature_columns = feature_columns
+        self.vix_col_idx = feature_columns.index("vix_level")
+
+    def fit(self, X, y):
+        return self
+
+    def predict(self, X):
+        preds = np.zeros(len(X))
+        for i, row in enumerate(X):
+            vix = row[self.vix_col_idx]
+            regime = "low" if vix < 15 else ("mid" if vix < 20 else "high")
+            model = self.ngb_models[regime]
+
+            if isinstance(model, dict):  # Linear QR fallback
+                X_const = np.concatenate([[1], row])
+                preds[i] = float(model["qr_p10"].predict(X_const)[0])
+            else:  # NGBoost
+                dist = model.pred_dist(row.reshape(1, -1))
+                mu = float(dist.params["loc"][0])
+                preds[i] = mu
+
+        return preds
+
+
 def run_calibration() -> dict:
-    # Load .env configuration
     load_dotenv(dotenv_path=BASE_DIR / ".env")
     target_coverage = float(os.getenv("TARGET_COVERAGE", "0.85"))
     logger.info(f"Loaded TARGET_COVERAGE={target_coverage} from .env")
 
-    # ------------------------------------------------------------------ #
-    # 1. Load artifacts
-    # ------------------------------------------------------------------ #
-    model_files = {
-        "lgbm_p10": MODELS_DIR / "lgbm_p10.pkl",
-        "lgbm_p90": MODELS_DIR / "lgbm_p90.pkl",
-        "feature_columns": MODELS_DIR / "feature_columns.pkl",
-    }
-    for name, path in model_files.items():
-        if not path.exists():
-            raise FileNotFoundError("Run module4_model.py first")
+    # Load regime models
+    meta_path = MODELS_DIR / "regime_model_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError("Run module4_model.py first")
 
-    lgbm_p10 = joblib.load(model_files["lgbm_p10"])
-    lgbm_p90 = joblib.load(model_files["lgbm_p90"])
-    feature_columns = joblib.load(model_files["feature_columns"])
-    logger.info("Loaded P10/P90 models and feature columns")
+    with open(meta_path) as f:
+        regime_meta = json.load(f)
+
+    ngb_models = {}
+    for regime in ["low", "mid", "high"]:
+        model_file = MODELS_DIR / regime_meta[regime]["model_file"]
+        ngb_models[regime] = joblib.load(model_file)
+
+    feature_columns = joblib.load(MODELS_DIR / "feature_columns.pkl")
+    logger.info("Loaded per-regime NGBoost models and feature columns")
 
     data_path = DATA_DIR / "feature_matrix_with_garch.parquet"
     if not data_path.exists():
@@ -49,9 +78,7 @@ def run_calibration() -> dict:
     df = pd.read_parquet(data_path)
     logger.info(f"Loaded feature matrix: {df.shape}")
 
-    # ------------------------------------------------------------------ #
-    # 2. Prepare data — same 80/20 time-series split as M4
-    # ------------------------------------------------------------------ #
+    # Prepare data — 80/20 split, then conf/eval
     df = df.sort_index()
     target_col = "log_range"
     available_features = [c for c in feature_columns if c in df.columns]
@@ -70,95 +97,47 @@ def run_calibration() -> dict:
     mid = n // 2
     X_conf, y_conf = X_calib_all.iloc[:mid], y_calib_all.iloc[:mid]
     X_eval, y_eval = X_calib_all.iloc[mid:], y_calib_all.iloc[mid:]
-    X_calib = X_conf.values
-    y_calib = y_conf.values
+    X_conf_arr = X_conf.values
+    y_conf_arr = y_conf.values
+    X_eval_arr = X_eval.values
+    y_eval_arr = y_eval.values
     logger.info(f"Calibration set size: {n} samples (conf={mid}, eval={n - mid})")
 
-    # ------------------------------------------------------------------ #
-    # 3. Fit MAPIE with quantile conformal method
-    # ------------------------------------------------------------------ #
-    # MAPIE 1.3.0 API: ConformalizedQuantileRegressor with prefit=True
-    # takes [lower_estimator, upper_estimator] and skips fit step,
-    # going directly to conformalize on the calibration set.
-    try:
-        from mapie.regression import ConformalizedQuantileRegressor
+    # Build wrapper + fit MAPIE
+    wrapper = RegimeNGBoostWrapper(ngb_models, feature_columns)
+    from mapie.regression import SplitConformalRegressor
 
-        mapie = ConformalizedQuantileRegressor(
-            estimator=[lgbm_p10, lgbm_p90],
-            confidence_level=target_coverage,  # target coverage = 1 - alpha
-            prefit=True,
-        )
-        # With prefit=True, _is_fitted is already True; call conformalize directly
-        mapie.conformalize(X_calib, y_calib)
-        logger.info("Fitted ConformalizedQuantileRegressor (MAPIE 1.3.0 API)")
-        use_new_api = True
+    mapie = SplitConformalRegressor(
+        estimator=wrapper,
+        confidence_level=target_coverage,
+        prefit=True,
+    )
+    mapie.conformalize(X_conf_arr, y_conf_arr)
+    logger.info("Fitted SplitConformalRegressor with RegimeNGBoostWrapper")
 
-    except Exception as e:
-        logger.warning(f"ConformalizedQuantileRegressor failed ({e}), falling back to SplitConformalRegressor")
+    # Compute coverage
+    def compute_coverage(confidence_level: float) -> float:
         try:
-            from mapie.regression import SplitConformalRegressor
-            mapie = SplitConformalRegressor(
-                estimator=lgbm_p90,
-                confidence_level=target_coverage,
+            m = SplitConformalRegressor(
+                estimator=RegimeNGBoostWrapper(ngb_models, feature_columns),
+                confidence_level=confidence_level,
                 prefit=True,
             )
-            mapie.conformalize(X_calib, y_calib)
-            use_new_api = True
-        except Exception as e2:
-            logger.warning(f"SplitConformalRegressor also failed ({e2}), using legacy MapieRegressor")
-            from mapie.regression import MapieRegressor
-            mapie = MapieRegressor(estimator=lgbm_p90, method="plus", cv="prefit")
-            mapie.fit(X_calib, y_calib)
-            use_new_api = False
-
-    # ------------------------------------------------------------------ #
-    # 4. Compute empirical coverage at multiple alpha levels
-    # ------------------------------------------------------------------ #
-    def compute_coverage(confidence_level: float) -> float:
-        """Get empirical coverage on eval half of calibration set at given confidence level."""
-        try:
-            if use_new_api:
-                try:
-                    from mapie.regression import ConformalizedQuantileRegressor
-                    m = ConformalizedQuantileRegressor(
-                        estimator=[lgbm_p10, lgbm_p90],
-                        confidence_level=confidence_level,
-                        prefit=True,
-                    )
-                    m.conformalize(X_conf, y_conf)
-                except Exception:
-                    from mapie.regression import SplitConformalRegressor
-                    m = SplitConformalRegressor(
-                        estimator=lgbm_p90,
-                        confidence_level=confidence_level,
-                        prefit=True,
-                    )
-                    m.conformalize(X_conf, y_conf)
-                try:
-                    preds = m.predict_interval(X_eval)
-                    lower, upper = preds[:, 0], preds[:, 1]
-                except AttributeError:
-                    _, y_pi = m.predict(X_eval, alpha=1 - confidence_level)
-                    if y_pi.ndim == 3:
-                        lower, upper = y_pi[:, 0, 0], y_pi[:, 1, 0]
-                    else:
-                        lower, upper = y_pi[:, 0], y_pi[:, 1]
-            else:
-                try:
-                    preds = mapie.predict_interval(X_eval)
-                    lower, upper = preds[:, 0], preds[:, 1]
-                except AttributeError:
-                    _, y_pi = mapie.predict(X_eval, alpha=1 - confidence_level)
-                    if y_pi.ndim == 3:
-                        lower, upper = y_pi[:, 0, 0], y_pi[:, 1, 0]
-                    else:
-                        lower, upper = y_pi[:, 0], y_pi[:, 1]
+            m.conformalize(X_conf_arr, y_conf_arr)
+            try:
+                preds = m.predict_interval(X_eval_arr)
+                lower, upper = preds[:, 0], preds[:, 1]
+            except AttributeError:
+                _, y_pi = m.predict(X_eval_arr, alpha=1 - confidence_level)
+                if y_pi.ndim == 3:
+                    lower, upper = y_pi[:, 0, 0], y_pi[:, 1, 0]
+                else:
+                    lower, upper = y_pi[:, 0], y_pi[:, 1]
+            covered = np.mean((lower <= y_eval_arr) & (y_eval_arr <= upper))
+            return float(covered)
         except Exception as e:
             logger.warning(f"Coverage computation failed at {confidence_level}: {e}")
             return float("nan")
-
-        covered = np.mean((lower <= y_eval.values) & (y_eval.values <= upper))
-        return float(covered)
 
     coverage_80 = compute_coverage(0.80)
     coverage_85 = compute_coverage(0.85)
@@ -170,16 +149,10 @@ def run_calibration() -> dict:
 
     for target, actual in [(0.80, coverage_80), (0.85, coverage_85), (0.90, coverage_90)]:
         if not np.isnan(actual) and actual < target:
-            logger.warning(
-                f"Coverage {actual:.4f} is below target {target:.2f} — "
-                "model may be under-confident"
-            )
+            logger.warning(f"Coverage {actual:.4f} is below target {target:.2f}")
 
-    # ------------------------------------------------------------------ #
-    # 5. Plot calibration curve
-    # ------------------------------------------------------------------ #
+    # Calibration curve
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-
     nominal_levels = np.arange(0.70, 0.96, 0.05)
     empirical_levels = [compute_coverage(cl) for cl in nominal_levels]
 
@@ -202,21 +175,18 @@ def run_calibration() -> dict:
     plt.close(fig)
     logger.info(f"Saved calibration curve to {plot_path}")
 
-    # ------------------------------------------------------------------ #
-    # 6. Save model and report
-    # ------------------------------------------------------------------ #
+    # Save model
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     model_path = MODELS_DIR / "mapie_calibrated.pkl"
     joblib.dump(mapie, model_path)
     logger.info(f"Saved calibrated MAPIE model to {model_path}")
 
     report = {
-        "coverage_at_80": round(coverage_80, 4),
-        "coverage_at_85": round(coverage_85, 4),
-        "coverage_at_90": round(coverage_90, 4),
+        "coverage_at_80": round(coverage_80, 4) if not np.isnan(coverage_80) else None,
+        "coverage_at_85": round(coverage_85, 4) if not np.isnan(coverage_85) else None,
+        "coverage_at_90": round(coverage_90, 4) if not np.isnan(coverage_90) else None,
     }
 
-    report = {k: (v if not (isinstance(v, float) and np.isnan(v)) else None) for k, v in report.items()}
     report_path = OUTPUTS_DIR / "calibration_report.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
