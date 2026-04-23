@@ -44,9 +44,9 @@ def _data_exists() -> bool:
 
 def _models_exist() -> bool:
     return (
-        (BASE_DIR / "models" / "ngb_low.pkl").exists()
-        and (BASE_DIR / "models" / "ngb_mid.pkl").exists()
-        and (BASE_DIR / "models" / "ngb_high.pkl").exists()
+        (BASE_DIR / "models" / "lgb_low.pkl").exists()
+        and (BASE_DIR / "models" / "lgb_mid.pkl").exists()
+        and (BASE_DIR / "models" / "lgb_high.pkl").exists()
     )
 
 

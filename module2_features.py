@@ -78,11 +78,15 @@ def build_features() -> pd.DataFrame:
     # ------------------------------------------------------------------
     # 1. Load inputs
     # ------------------------------------------------------------------
-    for path in [NIFTY_DAILY_PATH, NIFTY_5MIN_PATH, INDIA_VIX_PATH, NIFTY_WEEKLY_PATH]:
+    for path in [NIFTY_DAILY_PATH, INDIA_VIX_PATH, NIFTY_WEEKLY_PATH]:
         if not path.exists():
             raise FileNotFoundError(
                 f"{path} not found. Run module1_data_pipeline.py first"
             )
+    if not NIFTY_1H_PATH.exists() and not NIFTY_5MIN_PATH.exists():
+        raise FileNotFoundError(
+            f"Neither {NIFTY_1H_PATH} nor {NIFTY_5MIN_PATH} found. Run module1_data_pipeline.py first"
+        )
 
     logger.info("Loading daily OHLCV data...")
     daily = pd.read_parquet(NIFTY_DAILY_PATH)

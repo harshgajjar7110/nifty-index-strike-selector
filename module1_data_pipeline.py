@@ -80,11 +80,19 @@ def _load_csv_if_exists() -> pd.DataFrame | None:
         'Low': 'low',
         'Price': 'close'
     })
-    # Parse volume (e.g., "440.52M" → 440520000)
+
+    # Convert prices to float (remove commas from string prices)
+    for col in ['open', 'high', 'low', 'close']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+
+    # Parse volume (e.g., "440.52M" → 440520000, "1.36B" → 1360000000)
     def parse_vol(v):
         if isinstance(v, str):
             v = v.upper().replace(',', '')
-            if 'M' in v:
+            if 'B' in v:
+                return float(v.replace('B', '')) * 1e9
+            elif 'M' in v:
                 return float(v.replace('M', '')) * 1e6
             return float(v)
         return float(v)
@@ -104,6 +112,13 @@ def fetch_nifty_daily() -> pd.DataFrame:
     # Try loading from CSV first
     csv_data = _load_csv_if_exists()
 
+    # If CSV exists and parquet doesn't, use CSV as base and skip Yahoo Finance fetch
+    if csv_data is not None and not NIFTY_DAILY_PATH.exists():
+        logger.info(f"Using CSV data ({len(csv_data)} rows) as base. Skipping Yahoo Finance for this setup.")
+        _save(csv_data, NIFTY_DAILY_PATH)
+        return csv_data
+
+    # Check if parquet is already up to date
     last = _last_date(NIFTY_DAILY_PATH)
     start = (last + timedelta(days=1)) if last else (datetime.today() - timedelta(days=5 * 365))
     today = datetime.today()
@@ -112,13 +127,7 @@ def fetch_nifty_daily() -> pd.DataFrame:
         logger.info("nifty_daily.parquet is already up to date.")
         return pd.read_parquet(NIFTY_DAILY_PATH)
 
-    # If CSV exists and parquet doesn't, use CSV as base
-    if csv_data is not None and not NIFTY_DAILY_PATH.exists():
-        logger.info(f"Using CSV data ({len(csv_data)} rows) as base.")
-        _save(csv_data, NIFTY_DAILY_PATH)
-        last = _last_date(NIFTY_DAILY_PATH)
-        start = (last + timedelta(days=1)) if last else (datetime.today() - timedelta(days=5 * 365))
-
+    # Fetch only incremental data from Yahoo Finance
     raw = yf.download(NIFTY_SYMBOL, start=start.strftime("%Y-%m-%d"),
                       end=today.strftime("%Y-%m-%d"), interval="1d",
                       progress=False, auto_adjust=True)
