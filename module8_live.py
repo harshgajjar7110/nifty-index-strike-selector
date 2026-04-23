@@ -198,13 +198,40 @@ def run_live_pipeline() -> dict:
             oi_data=oi_data,
         )
 
-        # Console table
-        _print_spreads(spreads_result, week_label)
+        # Step 6.5 — Capital-aware sizing (module12, optional)
+        # ------------------------------------------------------------------
+        try:
+            from module12_capital import find_safest_viable_spread, _load_capital_config
+            logger.info("[Step 6.5] capital-aware strike selection (module12)")
+            cap_cfg = _load_capital_config()
 
-        # JSON file
+            for spread in spreads_result.get("spreads", []):
+                sizing = find_safest_viable_spread(
+                    spot=spot,
+                    base_short_K=spread["short_strike"],
+                    wing_width=spread["wing_width"],
+                    T_years=spread["dte_days"] / 365.0,
+                    sigma=spread.get("atm_iv_pct", vix_level) / 100.0 if vix_level else 0.16,
+                    spread_type=spread["spread_type"],
+                    lot_size=65,
+                    capital_config=cap_cfg,
+                )
+                spread["capital_sizing"] = sizing
+
+            logger.info("Capital sizing applied to all spreads")
+
+        except ImportError:
+            logger.debug("module12_capital not found — capital sizing skipped")
+        except Exception as e12:
+            logger.warning(f"Capital sizing failed (non-fatal): {e12}")
+
+        # JSON file (save before console print to avoid encoding issues)
         with open(SPREADS_JSON, "w") as fh:
             json.dump(spreads_result, fh, indent=2, default=str)
         logger.success(f"Spreads saved to {SPREADS_JSON}")
+
+        # Console table
+        _print_spreads(spreads_result, week_label)
 
     except SystemExit:
         # Propagate intentional exits (e.g. missing .env)
