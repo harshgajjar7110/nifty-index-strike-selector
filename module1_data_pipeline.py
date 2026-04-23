@@ -64,9 +64,46 @@ def _save(df: pd.DataFrame, path: Path) -> None:
 # Fetch functions
 # ---------------------------------------------------------------------------
 
+def _load_csv_if_exists() -> pd.DataFrame | None:
+    """Load Nifty 50 data from local CSV if it exists."""
+    csv_path = DATA_DIR / "Nifty 50 Historical Data.csv"
+    if not csv_path.exists():
+        return None
+
+    logger.info(f"Loading historical data from {csv_path.name}")
+    df = pd.read_csv(csv_path)
+    df['Date'] = pd.to_datetime(df['Date'], format='%d-%m-%Y')
+    df = df.rename(columns={
+        'Date': 'date',
+        'Open': 'open',
+        'High': 'high',
+        'Low': 'low',
+        'Price': 'close'
+    })
+    # Parse volume (e.g., "440.52M" → 440520000)
+    def parse_vol(v):
+        if isinstance(v, str):
+            v = v.upper().replace(',', '')
+            if 'M' in v:
+                return float(v.replace('M', '')) * 1e6
+            return float(v)
+        return float(v)
+    df['volume'] = df['Vol.'].apply(parse_vol)
+
+    df = df[['date', 'open', 'high', 'low', 'close', 'volume']].sort_values('date')
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    df.index.name = 'date'
+    return df
+
+
 def fetch_nifty_daily() -> pd.DataFrame:
     """Fetch / incrementally update Nifty 50 daily OHLCV (5 years)."""
     logger.info("=== Fetching Nifty 50 daily OHLCV ===")
+
+    # Try loading from CSV first
+    csv_data = _load_csv_if_exists()
+
     last = _last_date(NIFTY_DAILY_PATH)
     start = (last + timedelta(days=1)) if last else (datetime.today() - timedelta(days=5 * 365))
     today = datetime.today()
@@ -74,6 +111,13 @@ def fetch_nifty_daily() -> pd.DataFrame:
     if last and start.date() >= today.date():
         logger.info("nifty_daily.parquet is already up to date.")
         return pd.read_parquet(NIFTY_DAILY_PATH)
+
+    # If CSV exists and parquet doesn't, use CSV as base
+    if csv_data is not None and not NIFTY_DAILY_PATH.exists():
+        logger.info(f"Using CSV data ({len(csv_data)} rows) as base.")
+        _save(csv_data, NIFTY_DAILY_PATH)
+        last = _last_date(NIFTY_DAILY_PATH)
+        start = (last + timedelta(days=1)) if last else (datetime.today() - timedelta(days=5 * 365))
 
     raw = yf.download(NIFTY_SYMBOL, start=start.strftime("%Y-%m-%d"),
                       end=today.strftime("%Y-%m-%d"), interval="1d",

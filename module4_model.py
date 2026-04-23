@@ -1,6 +1,6 @@
 """
-Module 4 — NGBoost Regime Models + Conformal Calibration
-Trains per-VIX-regime NGBoost models (Normal dist) to predict weekly log-range of Nifty 50.
+Module 4 — LightGBM Quantile Regime Models
+Trains per-VIX-regime LightGBM models with quantile regression (P10, P90).
 Regimes: low (<15), mid (15–20), high (≥20).
 """
 
@@ -13,10 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import shap
-from scipy.stats import norm
-from ngboost import NGBRegressor
-from ngboost.distns import Normal
-import statsmodels.api as sm
+import lightgbm as lgb
 from loguru import logger
 
 BASE_DIR = Path(__file__).parent
@@ -62,11 +59,11 @@ def train_models() -> dict:
 
     # Assign regimes on train set
     train_regimes = assign_regime(X_train_df["vix_level"])
-    mask_array = (train_regimes == train_regimes).values  # ensure it's numpy array
+    mask_array = (train_regimes == train_regimes).values
     logger.info(f"Train regimes: low={sum(train_regimes=='low')}, mid={sum(train_regimes=='mid')}, high={sum(train_regimes=='high')}")
 
-    # Train per-regime models
-    ngb_models = {}
+    # Train per-regime LightGBM quantile models (P10 and P90)
+    lgb_models = {}
     regime_meta = {}
 
     for regime in ["low", "mid", "high"]:
@@ -78,37 +75,35 @@ def train_models() -> dict:
         logger.info(f"Training {regime} regime ({n_regime} rows)...")
 
         if n_regime >= MIN_DATA_PER_REGIME:
-            # NGBoost: Normal distribution output
-            ngb = NGBRegressor(
-                Dist=Normal,
-                n_estimators=NGBOOST_N_ESTIMATORS,
-                learning_rate=NGBOOST_LEARNING_RATE,
-                natural_gradient=True,
-                verbose=False,
-                random_state=42,
-            )
-            ngb.fit(X_regime, y_regime)
-            ngb_models[regime] = ngb
+            # LightGBM quantile regression for P10 and P90
+            train_data = lgb.Dataset(X_regime, label=y_regime)
+            params = {
+                "objective": "quantile",
+                "metric": "quantile",
+                "num_leaves": 31,
+                "learning_rate": 0.1,
+                "verbose": -1,
+            }
+
+            # Train P10 model
+            p10_params = params.copy()
+            p10_params["alpha"] = 0.10
+            lgb_p10 = lgb.train(p10_params, train_data, num_boost_round=100)
+
+            # Train P90 model
+            p90_params = params.copy()
+            p90_params["alpha"] = 0.90
+            lgb_p90 = lgb.train(p90_params, train_data, num_boost_round=100)
+
+            lgb_models[regime] = {"p10": lgb_p10, "p90": lgb_p90}
             regime_meta[regime] = {
-                "model_file": f"ngb_{regime}.pkl",
-                "source": "ngboost",
+                "model_file": f"lgb_{regime}.pkl",
+                "source": "lightgbm_quantile",
                 "n_train": int(n_regime),
             }
-            logger.info(f"{regime}: NGBoost trained ({n_regime} rows)")
+            logger.info(f"{regime}: LightGBM quantile trained ({n_regime} rows)")
         else:
-            # Fallback: Linear Quantile Regression
-            X_const = sm.add_constant(X_train_df.values)
-            qr_p10 = sm.QuantReg(y_train, X_const).fit(q=0.10)
-            qr_p90 = sm.QuantReg(y_train, X_const).fit(q=0.90)
-            # Store both for prediction
-            ngb = {"qr_p10": qr_p10, "qr_p90": qr_p90, "type": "quantile_regression"}
-            ngb_models[regime] = ngb
-            regime_meta[regime] = {
-                "model_file": f"ngb_{regime}.pkl",
-                "source": "quantile_regression_fallback",
-                "n_train": int(n_regime),
-            }
-            logger.info(f"{regime}: Linear QR fallback ({n_regime} rows < {MIN_DATA_PER_REGIME})")
+            logger.warning(f"{regime}: Insufficient data ({n_regime} rows < {MIN_DATA_PER_REGIME}), skipping")
 
     # Predict on test set per-regime
     test_regimes = assign_regime(X_test_df["vix_level"])
@@ -117,18 +112,14 @@ def train_models() -> dict:
 
     for idx, row_x in enumerate(X_test):
         regime = test_regimes.iloc[idx]
-        model = ngb_models[regime]
-
-        if isinstance(model, dict):  # Linear QR fallback
-            X_const_row = np.concatenate([[1], row_x]).reshape(1, -1)
-            p10_pred = float(model["qr_p10"].predict(X_const_row)[0])
-            p90_pred = float(model["qr_p90"].predict(X_const_row)[0])
-        else:  # NGBoost
-            dist = model.pred_dist(row_x.reshape(1, -1))
-            mu = float(dist.params["loc"][0])
-            sigma = float(dist.params["scale"][0])
-            p10_pred = float(norm.ppf(0.10, loc=mu, scale=sigma))
-            p90_pred = float(norm.ppf(0.90, loc=mu, scale=sigma))
+        if regime not in lgb_models:
+            logger.warning(f"Regime {regime} has no trained model, using global mean")
+            p10_pred = float(np.percentile(y_train, 10))
+            p90_pred = float(np.percentile(y_train, 90))
+        else:
+            models = lgb_models[regime]
+            p10_pred = float(models["p10"].predict(row_x.reshape(1, -1))[0])
+            p90_pred = float(models["p90"].predict(row_x.reshape(1, -1))[0])
 
         y_pred_p10_list.append(p10_pred)
         y_pred_p90_list.append(p90_pred)
@@ -152,12 +143,11 @@ def train_models() -> dict:
         else:
             regime_coverage[regime] = None
 
-    # SHAP per NGBoost regime (skip Linear QR fallback)
+    # SHAP for LightGBM models
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     for regime in ["low", "mid", "high"]:
-        model = ngb_models[regime]
-        if isinstance(model, dict):
-            logger.info(f"{regime}: Skipping SHAP (Linear QR fallback)")
+        if regime not in lgb_models:
+            logger.info(f"{regime}: No trained model, skipping SHAP")
             continue
 
         # Get test rows in this regime
@@ -167,11 +157,17 @@ def train_models() -> dict:
 
         X_regime_test = X_test_df[mask].values
         try:
-            explainer = shap.TreeExplainer(model.base_models[0])
+            # Use P10 model for SHAP
+            model = lgb_models[regime]["p10"]
+            explainer = shap.TreeExplainer(model)
             shap_values = explainer.shap_values(X_regime_test)
 
             fig = plt.figure()
-            shap.summary_plot(shap_values, X_regime_test, plot_type="bar", show=False)
+            if isinstance(shap_values, list):
+                shap_vals = shap_values[0]
+            else:
+                shap_vals = shap_values
+            shap.summary_plot(shap_vals, X_regime_test, plot_type="bar", show=False)
             plt.tight_layout()
             shap_path = OUTPUTS_DIR / f"shap_importance_{regime}.png"
             fig.savefig(shap_path, dpi=150, bbox_inches="tight")
@@ -183,8 +179,9 @@ def train_models() -> dict:
     # Save models
     MODELS_DIR.mkdir(exist_ok=True)
     for regime in ["low", "mid", "high"]:
-        model_path = MODELS_DIR / f"ngb_{regime}.pkl"
-        joblib.dump(ngb_models[regime], model_path)
+        if regime in lgb_models:
+            model_path = MODELS_DIR / f"lgb_{regime}.pkl"
+            joblib.dump(lgb_models[regime], model_path)
     joblib.dump(feature_columns, MODELS_DIR / "feature_columns.pkl")
     logger.info("Models saved to models/")
 

@@ -38,9 +38,9 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 _MODEL_CACHE: dict = {}
 
 def _load_models():
-    """Load per-regime NGBoost models and feature columns. Raises FileNotFoundError if missing."""
+    """Load per-regime LightGBM models and feature columns. Raises FileNotFoundError if missing."""
     if _MODEL_CACHE:
-        return _MODEL_CACHE["ngb"], _MODEL_CACHE["cols"]
+        return _MODEL_CACHE["lgb"], _MODEL_CACHE["cols"]
 
     meta_path = MODELS_DIR / "regime_model_meta.json"
     if not meta_path.exists():
@@ -49,16 +49,18 @@ def _load_models():
     with open(meta_path) as f:
         regime_meta = json.load(f)
 
-    ngb_models = {}
+    lgb_models = {}
     for regime in ["low", "mid", "high"]:
-        model_file = MODELS_DIR / regime_meta[regime]["model_file"]
-        ngb_models[regime] = joblib.load(model_file)
+        if regime in regime_meta:
+            model_file = MODELS_DIR / regime_meta[regime]["model_file"]
+            if (MODELS_DIR / model_file.name).exists():
+                lgb_models[regime] = joblib.load(model_file)
 
     feature_columns = joblib.load(MODELS_DIR / "feature_columns.pkl")
-    logger.info("Regime NGBoost models and feature columns loaded.")
-    _MODEL_CACHE["ngb"] = ngb_models
+    logger.info("Regime LightGBM models and feature columns loaded.")
+    _MODEL_CACHE["lgb"] = lgb_models
     _MODEL_CACHE["cols"] = feature_columns
-    return ngb_models, feature_columns
+    return lgb_models, feature_columns
 
 
 _CONFIG_CACHE: dict = {}
@@ -169,26 +171,26 @@ def predict_range(feature_row: pd.Series) -> dict:
 
     Returns dict with keys: log_range_p10, log_range_p90, log_range_mu, log_range_sigma, regime
     """
-    ngb_models, feature_columns = _load_models()
+    lgb_models, feature_columns = _load_models()
 
     X = feature_row[feature_columns].values.reshape(1, -1)
     vix = float(feature_row["vix_level"])
     regime = "low" if vix < 15 else ("mid" if vix < 20 else "high")
 
-    model = ngb_models[regime]
-
-    if isinstance(model, dict):  # Linear QR fallback
-        X_const = np.concatenate([[1], X[0]])
-        log_range_p10 = float(model["qr_p10"].predict(X_const)[0])
-        log_range_p90 = float(model["qr_p90"].predict(X_const)[0])
+    if regime not in lgb_models:
+        logger.warning(f"No model for regime {regime}, using fallback percentiles")
+        # Rough fallback
+        log_range_p10 = -0.15
+        log_range_p90 = 0.25
         log_range_mu = (log_range_p10 + log_range_p90) / 2
         log_range_sigma = (log_range_p90 - log_range_p10) / (2 * norm.ppf(0.90))
-    else:  # NGBoost
-        dist = model.pred_dist(X)
-        log_range_mu = float(dist.params["loc"][0])
-        log_range_sigma = float(dist.params["scale"][0])
-        log_range_p10 = float(norm.ppf(0.10, loc=log_range_mu, scale=log_range_sigma))
-        log_range_p90 = float(norm.ppf(0.90, loc=log_range_mu, scale=log_range_sigma))
+    else:
+        models = lgb_models[regime]
+        log_range_p10 = float(models["p10"].predict(X)[0])
+        log_range_p90 = float(models["p90"].predict(X)[0])
+        # Compute mu/sigma from P10 and P90 assuming Normal distribution
+        log_range_mu = (log_range_p10 + log_range_p90) / 2.0
+        log_range_sigma = (log_range_p90 - log_range_p10) / (2 * norm.ppf(0.90))
 
     logger.info(f"Predicted log_range: p10={log_range_p10:.4f}, p90={log_range_p90:.4f}, mu={log_range_mu:.4f}, sigma={log_range_sigma:.4f}, regime={regime}")
     return {
