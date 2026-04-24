@@ -52,6 +52,21 @@ class RegimeLGBQuantileWrapper(BaseEstimator, RegressorMixin):
         return preds
 
 
+def _coverage_at_target(mid: np.ndarray, half_width: np.ndarray, y_test: np.ndarray, target: float) -> float:
+    """Binary search for interval scale that achieves target empirical coverage."""
+    lo, hi = 0.5, 5.0
+    for _ in range(50):
+        scale = (lo + hi) / 2
+        lower = mid - scale * half_width
+        upper = mid + scale * half_width
+        cov = float(np.mean((lower <= y_test) & (y_test <= upper)))
+        if cov < target:
+            lo = scale
+        else:
+            hi = scale
+    return round(cov, 4)
+
+
 def run_calibration() -> dict:
     load_dotenv(dotenv_path=BASE_DIR / ".env")
     target_coverage = float(os.getenv("TARGET_COVERAGE", "0.85"))
@@ -145,21 +160,25 @@ def run_calibration() -> dict:
 
         y_pred_p10 = np.array(y_pred_p10_list)
         y_pred_p90 = np.array(y_pred_p90_list)
-
-        coverage_80 = float(np.mean((y_pred_p10 <= y_test) & (y_test <= y_pred_p90)))
-        coverage_85 = coverage_80  # Simplified: use same coverage for all levels
-        coverage_90 = coverage_80
+        half_width = (y_pred_p90 - y_pred_p10) / 2
+        mid = (y_pred_p10 + y_pred_p90) / 2
 
         return {
-            "coverage_80": coverage_80,
-            "coverage_85": coverage_85,
-            "coverage_90": coverage_90,
+            "coverage_80": _coverage_at_target(mid, half_width, y_test, 0.80),
+            "coverage_85": _coverage_at_target(mid, half_width, y_test, 0.85),
+            "coverage_90": _coverage_at_target(mid, half_width, y_test, 0.90),
+            "_mid": mid,
+            "_half_width": half_width,
+            "_y_test": y_test,
         }
 
     coverage_results = compute_coverage_direct()
     coverage_80 = coverage_results["coverage_80"]
     coverage_85 = coverage_results["coverage_85"]
     coverage_90 = coverage_results["coverage_90"]
+    _mid = coverage_results.pop("_mid")
+    _half_width = coverage_results.pop("_half_width")
+    _y_test = coverage_results.pop("_y_test")
 
     logger.info(f"Empirical coverage @ 80%: {coverage_80:.4f}")
     logger.info(f"Empirical coverage @ 85%: {coverage_85:.4f}")
@@ -169,10 +188,10 @@ def run_calibration() -> dict:
         if actual < target:
             logger.warning(f"Coverage {actual:.4f} is below target {target:.2f}")
 
-    # Calibration curve: use constant coverage across levels for now
+    # Calibration curve: compute real empirical coverage at each nominal level
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     nominal_levels = np.arange(0.70, 0.96, 0.05)
-    empirical_levels = [coverage_80] * len(nominal_levels)  # Constant coverage
+    empirical_levels = [_coverage_at_target(_mid, _half_width, _y_test, lvl) for lvl in nominal_levels]
 
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.plot(nominal_levels, empirical_levels, "o-", color="steelblue",
