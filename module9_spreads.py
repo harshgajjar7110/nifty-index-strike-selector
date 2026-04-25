@@ -227,12 +227,18 @@ def detect_direction(feature_row: pd.Series) -> dict:
     roc = _safe_get(feature_row, "prev_week_gap", 0.0)      # gap up = bullish
     vix_chg = _safe_get(feature_row, "vix_change_1w", 0.0) # rising = bearish
     is_event = int(_safe_get(feature_row, "is_event_week", 0))
-    
+    # GARCH acceleration: rising vol = bearish. garch_sigma_mean is current week's
+    # mean daily vol; garch_sigma_max is peak daily vol this week (proxy for prior stress).
+    # Positive diff = vol receding = less fear = bullish signal.
+    garch_cur  = _safe_get(feature_row, "garch_sigma_mean", 0.0)
+    garch_prev = _safe_get(feature_row, "garch_sigma_max",  0.0)
+    garch_acc  = garch_prev - garch_cur  # positive = vol falling = bullish
+
     # Normalize signals to [-1, +1]
     signals = {
         "roc_score":        np.clip(roc / 0.05, -1, 1),
         "vix_trend_score":  np.clip(-vix_chg / 2.0, -1, 1),
-        "garch_acc_score":  np.clip(-vix_chg / 3.0, -1, 1),
+        "garch_acc_score":  np.clip(garch_acc / 0.005, -1, 1),
     }
     
     # Composite Score
