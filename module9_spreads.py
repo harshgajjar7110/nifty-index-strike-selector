@@ -314,14 +314,17 @@ def generate_credit_spread(
         long_strike = short_strike + scaled_wing
 
     # Step 7: Probability of Profit (POP)
+    # garch_vol is daily mean vol (from garch_sigma_mean). Convert to weekly first,
+    # then scale to DTE. dte_scalar = sqrt(DTE/5); weekly_vol = daily_vol * sqrt(5).
+    # Combined: garch_vol * sqrt(5) * sqrt(DTE/5) = garch_vol * sqrt(DTE).
     pop_pct = None
     if garch_vol:
-        garch_vol_scaled = garch_vol * dte_scalar
+        garch_vol_for_dte = garch_vol * np.sqrt(max(dte_days, 1))
         if direction == 'bull_put':
-            z = np.log(spot / short_strike) / garch_vol_scaled
+            z = np.log(spot / short_strike) / garch_vol_for_dte
             pop_pct = float(norm.cdf(z))
         else:
-            z = np.log(short_strike / spot) / garch_vol_scaled
+            z = np.log(short_strike / spot) / garch_vol_for_dte
             pop_pct = float(norm.cdf(z))
 
     # Step 8: Premium and Metrics
