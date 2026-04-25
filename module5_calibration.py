@@ -22,13 +22,25 @@ OUTPUTS_DIR = BASE_DIR / "outputs"
 DATA_DIR = BASE_DIR / "data"
 
 
+def _load_regime_thresholds() -> tuple:
+    """Load optimized VIX regime thresholds from models/; fall back to defaults (15, 20)."""
+    thresh_path = Path(__file__).parent / "models" / "regime_thresholds.json"
+    if thresh_path.exists():
+        with open(thresh_path) as f:
+            t = json.load(f)
+        return t["low_thresh"], t["high_thresh"]
+    return 15.0, 20.0
+
+
 class RegimeLGBQuantileWrapper(BaseEstimator, RegressorMixin):
     """Route predictions by VIX regime to per-regime LightGBM quantile models."""
 
-    def __init__(self, lgb_models: dict, feature_columns: list):
+    def __init__(self, lgb_models: dict, feature_columns: list, low_thresh: float = 15.0, high_thresh: float = 20.0):
         self.lgb_models = lgb_models
         self.feature_columns = feature_columns
         self.vix_col_idx = feature_columns.index("vix_level")
+        self.low_thresh = low_thresh
+        self.high_thresh = high_thresh
         self.fitted_ = True
 
     def fit(self, X, y):
@@ -39,7 +51,7 @@ class RegimeLGBQuantileWrapper(BaseEstimator, RegressorMixin):
         preds = np.zeros(len(X))
         for i, row in enumerate(X):
             vix = row[self.vix_col_idx]
-            regime = "low" if vix < 15 else ("mid" if vix < 20 else "high")
+            regime = "low" if vix < self.low_thresh else ("mid" if vix < self.high_thresh else "high")
             if regime not in self.lgb_models:
                 preds[i] = 0.0
             else:
@@ -121,8 +133,11 @@ def run_calibration() -> dict:
     y_eval_arr = y_eval.values
     logger.info(f"Calibration set size: {n} samples (conf={mid}, eval={n - mid})")
 
+    low_thresh, high_thresh = _load_regime_thresholds()
+    logger.info(f"Loaded regime thresholds: low={low_thresh}, high={high_thresh}")
+
     # Build wrapper + fit MAPIE
-    wrapper = RegimeLGBQuantileWrapper(lgb_models, feature_columns)
+    wrapper = RegimeLGBQuantileWrapper(lgb_models, feature_columns, low_thresh, high_thresh)
     from mapie.regression import SplitConformalRegressor
 
     mapie = SplitConformalRegressor(
@@ -147,7 +162,7 @@ def run_calibration() -> dict:
         vix_col_idx = available_features.index("vix_level")
         for idx, row_x in enumerate(X_test):
             vix = row_x[vix_col_idx]
-            regime = "low" if vix < 15 else ("mid" if vix < 20 else "high")
+            regime = "low" if vix < low_thresh else ("mid" if vix < high_thresh else "high")
             if regime not in lgb_models:
                 y_pred_p10_list.append(np.percentile(y[:split_idx], 10))
                 y_pred_p90_list.append(np.percentile(y[:split_idx], 90))

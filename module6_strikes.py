@@ -35,6 +35,16 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _load_regime_thresholds() -> tuple:
+    """Load optimized VIX regime thresholds from models/; fall back to defaults (15, 20)."""
+    thresh_path = Path(__file__).parent / "models" / "regime_thresholds.json"
+    if thresh_path.exists():
+        with open(thresh_path) as f:
+            t = json.load(f)
+        return t["low_thresh"], t["high_thresh"]
+    return 15.0, 20.0
+
+
 _MODEL_CACHE: dict = {}
 
 def _load_models():
@@ -175,7 +185,8 @@ def predict_range(feature_row: pd.Series) -> dict:
 
     X = feature_row[feature_columns].values.reshape(1, -1)
     vix = float(feature_row["vix_level"])
-    regime = "low" if vix < 15 else ("mid" if vix < 20 else "high")
+    low_thresh, high_thresh = _load_regime_thresholds()
+    regime = "low" if vix < low_thresh else ("mid" if vix < high_thresh else "high")
 
     if regime not in lgb_models:
         logger.warning(f"No model for regime {regime}, using fallback percentiles")

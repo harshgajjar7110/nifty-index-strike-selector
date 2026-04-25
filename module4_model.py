@@ -74,6 +74,35 @@ def assign_regime(vix_series: pd.Series) -> pd.Series:
     return pd.cut(vix_series, bins=[-np.inf, 15.0, 20.0, np.inf], labels=["low", "mid", "high"])
 
 
+def _optimize_thresholds(X_train_df: pd.DataFrame, y_train: np.ndarray) -> tuple:
+    """Grid search VIX thresholds to minimize variance of regime sizes (balanced training data)."""
+    vix = X_train_df["vix_level"].values
+    best_score = float("inf")
+    best_low, best_high = 15.0, 20.0
+
+    for low_thresh in np.arange(12.0, 18.5, 0.5):
+        for high_thresh in np.arange(18.0, 25.5, 0.5):
+            if high_thresh <= low_thresh:
+                continue
+            n_low  = int(np.sum(vix < low_thresh))
+            n_mid  = int(np.sum((vix >= low_thresh) & (vix < high_thresh)))
+            n_high = int(np.sum(vix >= high_thresh))
+            counts = [n_low, n_mid, n_high]
+            if min(counts) < 10:
+                continue
+            score = float(np.var(counts))
+            if score < best_score:
+                best_score = score
+                best_low, best_high = low_thresh, high_thresh
+
+    logger.info(f"Optimized thresholds: low={best_low}, high={best_high} (variance={best_score:.1f})")
+    return best_low, best_high
+
+
+def assign_regime_dynamic(vix_series: pd.Series, low_thresh: float, high_thresh: float) -> pd.Series:
+    return pd.cut(vix_series, bins=[-np.inf, low_thresh, high_thresh, np.inf], labels=["low", "mid", "high"])
+
+
 def train_models() -> dict:
     # Load data
     if not DATA_PATH.exists():
@@ -99,8 +128,16 @@ def train_models() -> dict:
     y_train, y_test = y[:split], y[split:]
     logger.info(f"Train: {len(X_train)} rows  |  Test: {len(X_test)} rows")
 
+    # Optimize VIX regime thresholds
+    low_thresh, high_thresh = _optimize_thresholds(X_train_df, y_train)
+    thresh_path = MODELS_DIR / "regime_thresholds.json"
+    MODELS_DIR.mkdir(exist_ok=True)
+    with open(thresh_path, "w") as f:
+        json.dump({"low_thresh": float(low_thresh), "high_thresh": float(high_thresh)}, f, indent=2)
+    logger.info(f"Regime thresholds saved to {thresh_path}")
+
     # Assign regimes on train set
-    train_regimes = assign_regime(X_train_df["vix_level"])
+    train_regimes = assign_regime_dynamic(X_train_df["vix_level"], low_thresh, high_thresh)
     mask_array = (train_regimes == train_regimes).values
     logger.info(f"Train regimes: low={sum(train_regimes=='low')}, mid={sum(train_regimes=='mid')}, high={sum(train_regimes=='high')}")
 
@@ -159,7 +196,7 @@ def train_models() -> dict:
     logger.info(f"Best params saved to {params_path}")
 
     # Predict on test set per-regime
-    test_regimes = assign_regime(X_test_df["vix_level"])
+    test_regimes = assign_regime_dynamic(X_test_df["vix_level"], low_thresh, high_thresh)
     y_pred_p10_list = []
     y_pred_p90_list = []
 
