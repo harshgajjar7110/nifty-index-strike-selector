@@ -145,18 +145,18 @@ def get_nse_expiries(today: date, nse_expiry_list: list[str] | None = None) -> l
 def estimate_bs_price(
     S: float, K: float, T_years: float, sigma_annual: float,
     r: float = 0.065, option_type: str = 'put',
-    q: float = 0.015,    # ADD: Nifty dividend yield
+    q: float = 0.015,
+    vol_skew_factor: float = 0.0,
 ) -> float:
-    """Estimate theoretical option price using Black-Scholes."""
-    # Guard: at expiry or beyond
+    """Estimate theoretical option price via Black-Scholes with optional vol skew."""
     if T_years <= 0:
-        # Use 1 day as minimum for pricing if dte is 0
         T_years = 1.0 / 365.0
-    
-    # Guard: zero or negative vol
     if sigma_annual <= 0:
         sigma_annual = 0.10
-    
+    # Apply skew: OTM puts trade at higher IV proportional to OTM distance
+    if option_type == 'put' and vol_skew_factor > 0 and K < S:
+        otm_pct = (S - K) / S
+        sigma_annual = sigma_annual + vol_skew_factor * otm_pct
     # Compute d1, d2
     d1 = (np.log(S / K) + (r - q + 0.5 * sigma_annual**2) * T_years) / (sigma_annual * np.sqrt(T_years))
     d2 = d1 - sigma_annual * np.sqrt(T_years)
@@ -178,12 +178,13 @@ def estimate_spread_premium(
     r: float = 0.065,
     spread_type: str = 'bull_put',
     q: float = 0.015,
+    vol_skew_factor: float = 0.0,
 ) -> dict:
     """Estimate net credit and metrics for a bull put or bear call spread."""
     if spread_type == 'bull_put':
         # Bull put: sell short_K, buy long_K (long_K < short_K)
-        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'put', q)
-        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'put', q)
+        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'put', q, vol_skew_factor)
+        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'put', q, vol_skew_factor)
         premium_pts = short_price - long_price
         wing_width  = short_K - long_K
     else:  # bear_call
@@ -293,6 +294,7 @@ def generate_credit_spread(
 
     # Step 3: Load Base Config
     buffer_pts, wing_config, vix_baseline, _, min_buffer_pts, _ = _load_config()
+    vol_skew_factor = float(os.getenv("VOL_SKEW_FACTOR", "0.03"))
 
     # Step 4: VIX-Scaled and DTE-Scaled Buffer
     vix_scalar = vix_level / vix_baseline
@@ -337,7 +339,8 @@ def generate_credit_spread(
     T_years = dte_days / 365.0
     sigma_annual = atm_iv if (atm_iv and atm_iv > 0.05) else vix_level / 100.0
     metrics = estimate_spread_premium(
-        spot, short_strike, long_strike, T_years, sigma_annual, r, direction, q
+        spot, short_strike, long_strike, T_years, sigma_annual, r, direction, q,
+        vol_skew_factor=vol_skew_factor,
     )
 
     # Step 9: Return
