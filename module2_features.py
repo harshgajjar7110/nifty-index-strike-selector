@@ -29,15 +29,6 @@ FEATURE_MATRIX_PATH = DATA_DIR / "feature_matrix.parquet"
 
 
 
-def _days_to_next_expiry(friday: pd.Timestamp) -> float:
-    """Return calendar days from `friday` (week_end) to the next weekly expiry Thursday.
-
-    Nifty options expire every Thursday (weekly). Since week_end is a Friday,
-    the next expiry Thursday is always 6 calendar days away.
-    """
-    return 6.0
-
-
 def _compute_atr(daily: pd.DataFrame, n: int) -> pd.Series:
     """Compute N-day ATR from daily OHLCV DataFrame."""
     high = daily["high"]
@@ -243,22 +234,34 @@ def build_features() -> pd.DataFrame:
     bb_width.name = "bb_width"
 
     # ------------------------------------------------------------------
-    # 9. Days to expiry
+    # 9. 4-week momentum (lagged to avoid lookahead)
     # ------------------------------------------------------------------
-    logger.info("Computing days-to-expiry...")
-    # Nifty options expire every Thursday (weekly). week_end is always a Friday,
-    # so the next expiry Thursday is always 6 calendar days away.
-    all_fridays = weekly.index
-    dte = pd.Series(
-        [_days_to_next_expiry(f) for f in all_fridays],
-        index=all_fridays,
-        name="days_to_expiry",
-        dtype=float,
-    )
+    logger.info("Computing 4-week momentum...")
+    return_4w = np.log(weekly["close"] / weekly["close"].shift(4)).shift(1)
+    return_4w.name = "return_4w"
 
     # ------------------------------------------------------------------
-    # 10. Event week indicator
+    # 10. Realized vol skewness (rolling 20 daily log-returns, resampled weekly)
     # ------------------------------------------------------------------
+    logger.info("Computing realized vol skewness...")
+    daily_log_ret = np.log(daily["close"] / daily["close"].shift(1)).dropna()
+    vol_skew_daily = daily_log_ret.rolling(20, min_periods=10).skew()
+    vol_skew = _resample_weekly_last(vol_skew_daily)
+    vol_skew.name = "vol_skew"
+
+    # ------------------------------------------------------------------
+    # 11. VIX z-score (deviation from 52-week rolling mean)
+    # ------------------------------------------------------------------
+    logger.info("Computing VIX z-score...")
+    vix_52w_mean = vix_weekly.rolling(52, min_periods=20).mean()
+    vix_52w_std  = vix_weekly.rolling(52, min_periods=20).std()
+    vix_zscore   = (vix_weekly - vix_52w_mean) / vix_52w_std.clip(lower=0.01)
+    vix_zscore.name = "vix_zscore"
+
+    # ------------------------------------------------------------------
+    # 12. Event week indicator
+    # ------------------------------------------------------------------
+    all_fridays = weekly.index
     logger.info("Computing event-week flag...")
     is_event = pd.Series(
         [_is_event_week(f) for f in all_fridays],
@@ -268,14 +271,14 @@ def build_features() -> pd.DataFrame:
     )
 
     # ------------------------------------------------------------------
-    # 11. Target variable: log range
+    # 13. Target variable: log range
     # ------------------------------------------------------------------
     logger.info("Computing target variable log_range...")
     log_range = np.log(weekly["high"] / weekly["low"])
     log_range.name = "log_range"
 
     # ------------------------------------------------------------------
-    # 12. Merge all features
+    # 14. Merge all features
     # ------------------------------------------------------------------
     logger.info("Merging all features...")
     frames = [
@@ -286,7 +289,9 @@ def build_features() -> pd.DataFrame:
         range_1w, range_4w_avg,
         prev_week_gap,
         bb_width,
-        dte,
+        return_4w,
+        vol_skew,
+        vix_zscore,
         is_event,
         log_range,
     ]
@@ -303,7 +308,7 @@ def build_features() -> pd.DataFrame:
     logger.info(f"Dropped {before - after} rows with NaN (warm-up period). Remaining: {after}")
 
     # ------------------------------------------------------------------
-    # 13. Save
+    # 15. Save
     # ------------------------------------------------------------------
     logger.info(f"Saving feature matrix to {FEATURE_MATRIX_PATH}")
     df.to_parquet(FEATURE_MATRIX_PATH)
