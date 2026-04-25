@@ -1,6 +1,6 @@
 """
-Module 3: GARCH(1,1) Conditional Volatility
-Fits GARCH(1,1) on Nifty 50 daily log returns, extracts conditional volatility,
+Module 3: GJR-GARCH(1,1,1) Conditional Volatility
+Fits GJR-GARCH(1,1,1) with skewed-t distribution on Nifty 50 daily log returns, extracts conditional volatility,
 aggregates to weekly features, and merges into the feature matrix.
 """
 
@@ -36,11 +36,11 @@ def run_garch_pipeline() -> pd.DataFrame:
     returns = np.log(close / close.shift(1)).dropna() * 100
     logger.info(f"Computed {len(returns)} log returns")
 
-    # 3. Fit GARCH(1,1)
-    logger.info("Fitting GARCH(1,1) model...")
-    model = arch_model(returns, vol="Garch", p=1, q=1, dist="normal")
+    # 3. Fit GJR-GARCH(1,1,1) with skewed-t distribution
+    logger.info("Fitting GJR-GARCH(1,1,1) with skewed-t distribution...")
+    model = arch_model(returns, vol="Garch", p=1, o=1, q=1, dist="skewt")
     result = model.fit(disp="off")
-    logger.info("GARCH model fitted successfully")
+    logger.info("GJR-GARCH model fitted successfully")
 
     # 4. Extract conditional volatility and convert back from percentage
     cond_vol = result.conditional_volatility / 100
@@ -83,16 +83,26 @@ def run_garch_pipeline() -> pd.DataFrame:
 
     # 8. Print summary
     params = result.params
-    omega = params.get("omega", params.iloc[0])
-    alpha = params.get("alpha[1]", params.iloc[1])
-    beta = params.get("beta[1]", params.iloc[2])
+    omega = float(params.get("omega", params.iloc[0]))
+    alpha = float(params.get("alpha[1]", 0.0))
+    gamma = float(params.get("gamma[1]", 0.0))
+    beta  = float(params.get("beta[1]", 0.0))
+    nu    = params.get("nu", None)
+    lam   = params.get("lambda", None)
 
-    print(f"\n--- GARCH(1,1) Summary ---")
+    persistence = alpha + 0.5 * gamma + beta
+
+    print(f"\n--- GJR-GARCH(1,1,1) Summary ---")
     print(f"Rows in final feature matrix: {len(merged)}")
-    print(f"omega  = {omega:.6f}")
-    print(f"alpha  = {alpha:.6f}")
-    print(f"beta   = {beta:.6f}")
-    print(f"alpha + beta = {alpha + beta:.6f}")
+    print(f"omega       = {omega:.6f}")
+    print(f"alpha[1]    = {alpha:.6f}")
+    print(f"gamma[1]    = {gamma:.6f}  (leverage: neg returns increase vol more)")
+    print(f"beta[1]     = {beta:.6f}")
+    print(f"persistence = alpha + 0.5*gamma + beta = {persistence:.6f}")
+    if nu is not None:
+        print(f"nu (df)     = {float(nu):.4f}")
+    if lam is not None:
+        print(f"lambda (skew) = {float(lam):.4f}")
 
     return merged
 
