@@ -1,7 +1,6 @@
-"""
 Module 9: Credit Spread Generation System
-Implements bull put and bear call credit spreads across multiple expiries (weekly, monthly).
-Includes Black-Scholes premium estimation and direction signal detection.
+Bull put + bear call credit spreads across multiple expiries (weekly, monthly).
+Black-Scholes premium estimation + direction signal detection.
 
 Usage:
     from module9_spreads import generate_all_spreads
@@ -46,13 +45,13 @@ NSE_HOLIDAYS: set[date] = {
 # ---------------------------------------------------------------------------
 
 def _adjust_for_holiday(d: date) -> date:
-    """If date is NSE holiday or weekend, move to previous trading day."""
+    """If NSE holiday or weekend, move to previous trading day."""
     while d in NSE_HOLIDAYS or d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
 
 def _safe_get(row, col, default):
-    """Safely get a value from a pandas Series."""
+    """Safe value get from pandas Series."""
     if col in row.index and pd.notna(row[col]):
         return float(row[col])
     return default
@@ -61,7 +60,7 @@ NSE_EXPIRY_WEEKDAY = 1  # NSE Nifty 50 options expire on Tuesday (changed from T
 NIFTY_LOT_SIZE = 65    # NSE Nifty 50 lot size (as of 2024)
 
 def _last_expiry_weekday_of_month(year: int, month: int) -> date:
-    """Find the last NSE_EXPIRY_WEEKDAY of a given month."""
+    """Find last NSE_EXPIRY_WEEKDAY of given month."""
     last_day = monthrange(year, month)[1]
     d = date(year, month, last_day)
     while d.weekday() != NSE_EXPIRY_WEEKDAY:
@@ -69,7 +68,7 @@ def _last_expiry_weekday_of_month(year: int, month: int) -> date:
     return d
 
 def _is_last_expiry_weekday(d: date) -> bool:
-    """Check if d is the last expiry weekday (monthly expiry) of its month."""
+    """Check if d is last expiry weekday (monthly expiry) of its month."""
     if d.weekday() != NSE_EXPIRY_WEEKDAY:
         return False
     return (d + timedelta(days=7)).month != d.month
@@ -80,11 +79,11 @@ def _is_last_expiry_weekday(d: date) -> bool:
 
 def get_nse_expiries(today: date, nse_expiry_list: list[str] | None = None) -> list[dict]:
     """
-    Compute upcoming Nifty options expiry dates (weekly and monthly).
+    Compute upcoming Nifty options expiry dates (weekly + monthly).
 
-    If nse_expiry_list is provided (from live OI chain, format '28-Apr-2026'),
-    uses those exact dates — most accurate, handles any NSE schedule change.
-    Otherwise falls back to computed Tuesday-based calendar.
+    If nse_expiry_list provided (from live OI chain, format '28-Apr-2026'),
+    use exact dates — most accurate, handles NSE schedule changes.
+    Else fall back to computed Tuesday-based calendar.
 
     Returns 3 expiries: nearest, next week, next month's last expiry.
     """
@@ -145,22 +144,18 @@ def get_nse_expiries(today: date, nse_expiry_list: list[str] | None = None) -> l
 def estimate_bs_price(
     S: float, K: float, T_years: float, sigma_annual: float,
     r: float = 0.065, option_type: str = 'put',
-    q: float = 0.015,
-    vol_skew_factor: float = 0.0,
+    q: float = 0.015,    # ADD: Nifty dividend yield
 ) -> float:
-    """Estimate theoretical option price via Black-Scholes with optional vol skew."""
+    """Estimate theoretical option price via Black-Scholes."""
+    # Guard: at expiry or beyond
     if T_years <= 0:
+        # Use 1 day as minimum for pricing if dte is 0
         T_years = 1.0 / 365.0
+    
+    # Guard: zero or negative vol
     if sigma_annual <= 0:
         sigma_annual = 0.10
-    # Apply skew: OTM puts/calls trade at higher IV proportional to OTM distance
-    if vol_skew_factor > 0:
-        if option_type == 'put' and K < S:
-            otm_pct = (S - K) / S
-            sigma_annual = sigma_annual + vol_skew_factor * otm_pct
-        elif option_type == 'call' and K > S:
-            otm_pct = (K - S) / S
-            sigma_annual = sigma_annual + vol_skew_factor * otm_pct
+    
     # Compute d1, d2
     d1 = (np.log(S / K) + (r - q + 0.5 * sigma_annual**2) * T_years) / (sigma_annual * np.sqrt(T_years))
     d2 = d1 - sigma_annual * np.sqrt(T_years)
@@ -182,20 +177,18 @@ def estimate_spread_premium(
     r: float = 0.065,
     spread_type: str = 'bull_put',
     q: float = 0.015,
-    vol_skew_factor: float = 0.0,
 ) -> dict:
-    """Estimate net credit and metrics for a bull put or bear call spread."""
+    """Net credit + metrics for bull put or bear call spread."""
     if spread_type == 'bull_put':
         # Bull put: sell short_K, buy long_K (long_K < short_K)
-        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'put', q, vol_skew_factor)
-        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'put', q, vol_skew_factor)
+        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'put', q)
+        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'put', q)
         premium_pts = short_price - long_price
         wing_width  = short_K - long_K
     else:  # bear_call
         # Bear call: sell short_K, buy long_K (long_K > short_K)
-        call_skew_factor = float(os.getenv("CALL_SKEW_FACTOR", "0.01"))
-        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'call', q, call_skew_factor)
-        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'call', q, call_skew_factor)
+        short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'call', q)
+        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'call', q)
         premium_pts = short_price - long_price
         wing_width  = long_K - short_K
     
@@ -222,8 +215,8 @@ def estimate_spread_premium(
 
 def detect_direction(feature_row: pd.Series) -> dict:
     """
-    Determine bullish/bearish/neutral direction based on feature signals.
-    Uses momentum (gap) and VIX trend.
+    Bullish/bearish/neutral direction from feature signals.
+    Uses momentum (gap) + VIX trend.
     """
     # Load config from env
     load_dotenv(dotenv_path=BASE_DIR / ".env")
@@ -233,25 +226,19 @@ def detect_direction(feature_row: pd.Series) -> dict:
     roc = _safe_get(feature_row, "prev_week_gap", 0.0)      # gap up = bullish
     vix_chg = _safe_get(feature_row, "vix_change_1w", 0.0) # rising = bearish
     is_event = int(_safe_get(feature_row, "is_event_week", 0))
-    # GARCH acceleration: rising vol = bearish. garch_sigma_mean is current week's
-    # mean daily vol; garch_sigma_max is peak daily vol this week (proxy for prior stress).
-    # Positive diff = vol receding = less fear = bullish signal.
-    garch_cur  = _safe_get(feature_row, "garch_sigma_mean", 0.0)
-    garch_prev = _safe_get(feature_row, "garch_sigma_max",  0.0)
-    garch_acc  = garch_prev - garch_cur  # positive = vol falling = bullish
-
+    
     # Normalize signals to [-1, +1]
     signals = {
         "roc_score":        np.clip(roc / 0.05, -1, 1),
         "vix_trend_score":  np.clip(-vix_chg / 2.0, -1, 1),
-        "garch_acc_score":  np.clip(garch_acc / 0.005, -1, 1),
+        "garch_acc_score":  np.clip(-vix_chg / 3.0, -1, 1),
     }
     
     # Composite Score
     weights = {"roc_score": 0.45, "vix_trend_score": 0.35, "garch_acc_score": 0.20}
     composite = sum(signals[k] * w for k, w in weights.items())
     
-    # Confidence (Event weeks reduce confidence)
+    # Confidence (event weeks reduce confidence)
     raw_confidence = abs(composite)
     event_penalty = 0.70 if is_event else 1.0
     confidence = raw_confidence * event_penalty
@@ -288,10 +275,8 @@ def generate_credit_spread(
     r: float = 0.065,
     q: float = 0.015,
     atm_iv: float | None = None,
-    log_range_mu: float | None = None,
-    log_range_sigma: float | None = None,
 ) -> dict:
-    """Generate bull put or bear call strikes for a given expiry."""
+    """Bull put or bear call strikes for given expiry."""
     # Step 1: DTE Scaling Factor
     # sqrt(DTE/5): wider buffer/wing for longer-dated spreads (more time to breach)
     dte_scalar = np.sqrt(max(dte_days, 1) / 5.0)
@@ -301,7 +286,6 @@ def generate_credit_spread(
 
     # Step 3: Load Base Config
     buffer_pts, wing_config, vix_baseline, _, min_buffer_pts, _ = _load_config()
-    vol_skew_factor = float(os.getenv("VOL_SKEW_FACTOR", "0.03"))
 
     # Step 4: VIX-Scaled and DTE-Scaled Buffer
     vix_scalar = vix_level / vix_baseline
@@ -329,33 +313,21 @@ def generate_credit_spread(
         long_strike = short_strike + scaled_wing
 
     # Step 7: Probability of Profit (POP)
-    # Primary: Use log_range_mu/sigma from LightGBM model (same distribution used for strike placement)
-    # Fallback: GARCH-based lognormal (daily vol scaled to DTE)
     pop_pct = None
-    if log_range_mu is not None and log_range_sigma is not None and log_range_sigma > 0:
-        try:
-            from module4b_risk import breach_probability
-            side = "put" if direction == "bull_put" else "call"
-            breach_p = breach_probability(short_strike, log_range_mu, log_range_sigma, spot, side)
-            pop_pct = float(1 - breach_p)
-        except Exception as e:
-            logger.warning(f"breach_probability call failed: {e}; will try GARCH fallback")
-
-    if pop_pct is None and garch_vol:
-        garch_vol_for_dte = garch_vol * np.sqrt(max(dte_days, 1))
+    if garch_vol:
+        garch_vol_scaled = garch_vol * dte_scalar
         if direction == 'bull_put':
-            z = np.log(spot / short_strike) / garch_vol_for_dte
+            z = np.log(spot / short_strike) / garch_vol_scaled
             pop_pct = float(norm.cdf(z))
         else:
-            z = np.log(short_strike / spot) / garch_vol_for_dte
+            z = np.log(short_strike / spot) / garch_vol_scaled
             pop_pct = float(norm.cdf(z))
 
     # Step 8: Premium and Metrics
     T_years = dte_days / 365.0
     sigma_annual = atm_iv if (atm_iv and atm_iv > 0.05) else vix_level / 100.0
     metrics = estimate_spread_premium(
-        spot, short_strike, long_strike, T_years, sigma_annual, r, direction, q,
-        vol_skew_factor=vol_skew_factor,
+        spot, short_strike, long_strike, T_years, sigma_annual, r, direction, q
     )
 
     # Step 9: Return
@@ -390,14 +362,14 @@ def generate_all_spreads(
     q: float | None = None,
     oi_data: dict | None = None,
 ) -> dict:
-    """Orchestrate spread generation for 3 expiries."""
+    """Spread generation for 3 expiries."""
     load_dotenv(dotenv_path=BASE_DIR / ".env")
     if r is None:
         r = float(os.getenv("RISK_FREE_RATE", 0.065))
     if q is None:
         q = float(os.getenv("DIVIDEND_YIELD", 0.015))
 
-    # Extract OI-derived inputs (all optional; None = fall back to GARCH/VIX)
+    # OI-derived inputs (all optional; None = fall back to GARCH/VIX)
     atm_iv         = oi_data.get("atm_iv")        if oi_data else None
     pcr            = oi_data.get("pcr")            if oi_data else None
     oi_strikes     = {int(k): v for k, v in oi_data.get("strikes", {}).items()} if oi_data else {}
@@ -424,8 +396,7 @@ def generate_all_spreads(
         logger.info(f"PCR={pcr:.2f} → direction: {_pcr_dir}")
         direction_result = {**direction_result, "pcr": pcr, "pcr_direction": _pcr_dir}
 
-    # Always generate both types for all expiries to provide a full market view,
-    # regardless of the directional "opinion".
+    # Generate both types for all expiries — full market view regardless of directional opinion.
     spread_types = ["bull_put", "bear_call"]
     
     # Step 4: Generate
@@ -444,26 +415,14 @@ def generate_all_spreads(
                     r=r,
                     q=q,
                     atm_iv=atm_iv,
-                    log_range_mu=range_pred.get("log_range_mu"),
-                    log_range_sigma=range_pred.get("log_range_sigma"),
                 )
                 
                 spread["expiry_date"] = exp_dict["date"].isoformat()
                 spread["expiry_type"] = exp_dict["type"]
                 
                 # EV Proxy
-                if spread["pop_pct"] is None:
-                    logger.warning(
-                        f"pop_pct unavailable for {spread['spread_type']} "
-                        f"{int(spread['short_strike'])}/{int(spread['long_strike'])} "
-                        f"DTE={spread['dte_days']} — falling back to pop=0.70 (unreliable EV)"
-                    )
-                    pop = 0.70
-                else:
-                    pop = spread["pop_pct"]
-                spread["ev_proxy"] = round(
-                    spread["premium_pts"] * pop - spread["max_loss_pts"] * (1 - pop), 4
-                )
+                pop = spread["pop_pct"] if spread["pop_pct"] is not None else 0.70
+                spread["ev_proxy"] = round(spread["rr_ratio"] * pop, 4)
                 
                 # Min RR check
                 min_rr = float(os.getenv("MIN_RR_RATIO", 0.15))
@@ -476,7 +435,7 @@ def generate_all_spreads(
     # Step 5: Rank
     all_spreads.sort(key=lambda x: x["ev_proxy"], reverse=True)
 
-    # Feasibility filter: drop spreads that don't meet min RR
+    # Feasibility filter: drop spreads below min RR
     before_rr = len(all_spreads)
     all_spreads = [s for s in all_spreads if s["meets_min_rr"]]
     if len(all_spreads) < before_rr:
@@ -527,8 +486,7 @@ if __name__ == "__main__":
         "garch_sigma_mean": 0.012
     })
     
-    # We need real model files for predict_range to work in generate_all_spreads
-    # If they don't exist, this will fail gracefully or I can mock predict_range
+    # Need real model files for predict_range to work in generate_all_spreads
     try:
         res = generate_all_spreads(mock_row, 24500, 16.0, 0.012)
         print(json.dumps(res, indent=2, default=str))

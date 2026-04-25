@@ -381,6 +381,24 @@ def run_backtest() -> dict:
     # Rough heuristic: 1% breach difference ≈ 25 pts of skew needed
     recommended_put_skew = int(max(0, skew_imbalance * SKEW_PTS_PER_PERCENT_IMBALANCE))
 
+    # POP vs Actual Validation — detect model drift
+    pop_accuracy = {}
+    if pop_stats.get("avg_pop_pct") is not None:
+        pop_error = round(float(pop_stats["avg_pop_pct"] - win_rate), 2)
+        call_error = round(float((pop_stats.get("avg_breach_prob_call_pct", 0) or 0) - breach_rate_up), 2)
+        put_error  = round(float((pop_stats.get("avg_breach_prob_put_pct", 0) or 0) - breach_rate_down), 2)
+        pop_accuracy = {
+            "pop_vs_winrate_error_pct": pop_error,
+            "breach_call_error_pct": call_error,
+            "breach_put_error_pct": put_error,
+        }
+        if abs(pop_error) > 5.0:
+            logger.warning(f"POP model drift: predicted={pop_stats['avg_pop_pct']:.1f}% vs actual={win_rate:.1f}% (error={pop_error:.1f}pp)")
+        if abs(call_error) > 5.0:
+            logger.warning(f"Call breach model drift: predicted={pop_stats.get('avg_breach_prob_call_pct', 0):.1f}% vs actual={breach_rate_up:.1f}% (error={call_error:.1f}pp)")
+        if abs(put_error) > 5.0:
+            logger.warning(f"Put breach model drift: predicted={pop_stats.get('avg_breach_prob_put_pct', 0):.1f}% vs actual={breach_rate_down:.1f}% (error={put_error:.1f}pp)")
+
     summary = {
         "total_trades": int(total_trades),
         "win_rate_pct": round(float(win_rate), 2),
@@ -395,6 +413,7 @@ def run_backtest() -> dict:
         "wing_width_points": "dynamic (see backtest_results.csv column 'wing_width_pts')",
         **premium_stats,
         **pop_stats,
+        **pop_accuracy,
         "lot_size": LOT_SIZE,
         "breach_rate_up_pct": round(float(breach_rate_up), 2),
         "breach_rate_down_pct": round(float(breach_rate_down), 2),

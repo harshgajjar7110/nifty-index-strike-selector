@@ -21,7 +21,8 @@
       "Bash(git config *)",
       "Bash(git commit -m 'feat: nifty 50 iron condor + credit spread engine with VIX scaling *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(git commit *)"
     ]
   }
 }
