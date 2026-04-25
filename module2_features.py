@@ -238,15 +238,16 @@ def build_features() -> pd.DataFrame:
     # ------------------------------------------------------------------
     logger.info("Computing 4-week momentum...")
     return_4w = np.log(weekly["close"] / weekly["close"].shift(4)).shift(1)
+    return_4w = return_4w.replace([np.inf, -np.inf], np.nan)
     return_4w.name = "return_4w"
 
     # ------------------------------------------------------------------
     # 10. Realized vol skewness (rolling 20 daily log-returns, resampled weekly)
     # ------------------------------------------------------------------
     logger.info("Computing realized vol skewness...")
-    daily_log_ret = np.log(daily["close"] / daily["close"].shift(1)).dropna()
+    daily_log_ret = np.log(daily["close"] / daily["close"].shift(1))
     vol_skew_daily = daily_log_ret.rolling(20, min_periods=10).skew()
-    vol_skew = _resample_weekly_last(vol_skew_daily)
+    vol_skew = _resample_weekly_last(vol_skew_daily).shift(1)
     vol_skew.name = "vol_skew"
 
     # ------------------------------------------------------------------
