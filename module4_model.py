@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import shap
 import lightgbm as lgb
 from loguru import logger
+from sklearn.model_selection import TimeSeriesSplit
 
 BASE_DIR = Path(__file__).parent
 DATA_PATH = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
@@ -25,6 +26,47 @@ REGIME_THRESHOLDS = (15.0, 20.0)
 MIN_DATA_PER_REGIME = 10  # Lower threshold to use NGBoost for more regimes
 NGBOOST_N_ESTIMATORS = 250
 NGBOOST_LEARNING_RATE = 0.05
+
+
+def _tune_lgb_regime(X_regime: np.ndarray, y_regime: np.ndarray) -> dict:
+    """Grid search LightGBM hyperparams using 3-fold TimeSeriesSplit. Returns best params."""
+    if len(X_regime) < 20:
+        logger.warning("Too few samples for tuning, using defaults")
+        return {"num_leaves": 31, "learning_rate": 0.1, "num_boost_round": 100}
+
+    best_score = float("inf")
+    best_params = {"num_leaves": 31, "learning_rate": 0.1, "num_boost_round": 100}
+    tscv = TimeSeriesSplit(n_splits=3)
+
+    for num_leaves in [15, 31, 63]:
+        for lr in [0.05, 0.1, 0.15]:
+            for n_rounds in [100, 200, 300]:
+                scores = []
+                for train_idx, val_idx in tscv.split(X_regime):
+                    X_tr, X_val = X_regime[train_idx], X_regime[val_idx]
+                    y_tr, y_val = y_regime[train_idx], y_regime[val_idx]
+                    train_data = lgb.Dataset(X_tr, label=y_tr)
+                    params = {
+                        "objective": "quantile",
+                        "metric": "quantile",
+                        "alpha": 0.90,
+                        "num_leaves": num_leaves,
+                        "learning_rate": lr,
+                        "verbose": -1,
+                    }
+                    m = lgb.train(params, train_data, num_boost_round=n_rounds)
+                    preds = m.predict(X_val)
+                    pinball = float(np.mean(
+                        np.where(y_val >= preds, 0.90 * (y_val - preds), (0.90 - 1) * (y_val - preds))
+                    ))
+                    scores.append(pinball)
+                avg = np.mean(scores)
+                if avg < best_score:
+                    best_score = avg
+                    best_params = {"num_leaves": num_leaves, "learning_rate": lr, "num_boost_round": n_rounds}
+
+    logger.info(f"Best params (score={best_score:.6f}): {best_params}")
+    return best_params
 
 
 def assign_regime(vix_series: pd.Series) -> pd.Series:
@@ -75,35 +117,46 @@ def train_models() -> dict:
         logger.info(f"Training {regime} regime ({n_regime} rows)...")
 
         if n_regime >= MIN_DATA_PER_REGIME:
-            # LightGBM quantile regression for P10 and P90
+            # Tune hyperparams per regime using TimeSeriesSplit CV
+            best = _tune_lgb_regime(X_regime, y_regime)
             train_data = lgb.Dataset(X_regime, label=y_regime)
             params = {
                 "objective": "quantile",
                 "metric": "quantile",
-                "num_leaves": 31,
-                "learning_rate": 0.1,
+                "num_leaves": best["num_leaves"],
+                "learning_rate": best["learning_rate"],
                 "verbose": -1,
             }
+            n_rounds = best["num_boost_round"]
 
             # Train P10 model
             p10_params = params.copy()
             p10_params["alpha"] = 0.10
-            lgb_p10 = lgb.train(p10_params, train_data, num_boost_round=100)
+            lgb_p10 = lgb.train(p10_params, train_data, num_boost_round=n_rounds)
 
             # Train P90 model
             p90_params = params.copy()
             p90_params["alpha"] = 0.90
-            lgb_p90 = lgb.train(p90_params, train_data, num_boost_round=100)
+            lgb_p90 = lgb.train(p90_params, train_data, num_boost_round=n_rounds)
 
             lgb_models[regime] = {"p10": lgb_p10, "p90": lgb_p90}
             regime_meta[regime] = {
                 "model_file": f"lgb_{regime}.pkl",
                 "source": "lightgbm_quantile",
                 "n_train": int(n_regime),
+                "best_params": best,
             }
             logger.info(f"{regime}: LightGBM quantile trained ({n_regime} rows)")
         else:
             logger.warning(f"{regime}: Insufficient data ({n_regime} rows < {MIN_DATA_PER_REGIME}), skipping")
+
+    # Save best hyperparameters per regime
+    best_params_all = {r: regime_meta[r].get("best_params", {}) for r in ["low", "mid", "high"] if r in regime_meta}
+    MODELS_DIR.mkdir(exist_ok=True)
+    params_path = MODELS_DIR / "lgb_best_params.json"
+    with open(params_path, "w") as f:
+        json.dump(best_params_all, f, indent=2)
+    logger.info(f"Best params saved to {params_path}")
 
     # Predict on test set per-regime
     test_regimes = assign_regime(X_test_df["vix_level"])
