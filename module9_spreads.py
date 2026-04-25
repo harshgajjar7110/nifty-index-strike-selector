@@ -427,7 +427,9 @@ def generate_all_spreads(
                 
                 # EV Proxy
                 pop = spread["pop_pct"] if spread["pop_pct"] is not None else 0.70
-                spread["ev_proxy"] = round(spread["rr_ratio"] * pop, 4)
+                spread["ev_proxy"] = round(
+                    spread["premium_pts"] * pop - spread["max_loss_pts"] * (1 - pop), 4
+                )
                 
                 # Min RR check
                 min_rr = float(os.getenv("MIN_RR_RATIO", 0.15))
