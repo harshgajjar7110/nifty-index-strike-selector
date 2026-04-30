@@ -213,19 +213,21 @@ def estimate_spread_premium(
     spread_type: str = 'bull_put',
     q: float = 0.015,
     vol_skew_factor: float = 0.0,
+    long_iv_override: float | None = None,
 ) -> dict:
     """Estimate net credit and metrics for a bull put or bear call spread."""
+    long_sigma = long_iv_override if (long_iv_override and long_iv_override > 0.05) else sigma_annual
     if spread_type == 'bull_put':
         # Bull put: sell short_K, buy long_K (long_K < short_K)
         short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'put', q, vol_skew_factor)
-        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'put', q, vol_skew_factor)
+        long_price  = estimate_bs_price(S, long_K,  T_years, long_sigma,   r, 'put', q, 0.0)
         premium_pts = short_price - long_price
         wing_width  = short_K - long_K
     else:  # bear_call
         # Bear call: sell short_K, buy long_K (long_K > short_K)
         call_skew_factor = float(os.getenv("CALL_SKEW_FACTOR", "0.01"))
         short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'call', q, call_skew_factor)
-        long_price  = estimate_bs_price(S, long_K,  T_years, sigma_annual, r, 'call', q, call_skew_factor)
+        long_price  = estimate_bs_price(S, long_K,  T_years, long_sigma,   r, 'call', q, 0.0)
         premium_pts = short_price - long_price
         wing_width  = long_K - short_K
     
@@ -320,6 +322,7 @@ def generate_credit_spread(
     atm_iv: float | None = None,
     log_range_mu: float | None = None,
     log_range_sigma: float | None = None,
+    oi_strikes: dict | None = None,
 ) -> dict:
     """Generate bull put or bear call strikes for a given expiry."""
     # Step 1: DTE Scaling Factor
@@ -359,33 +362,54 @@ def generate_credit_spread(
         long_strike = short_strike + scaled_wing
 
     # Step 7: Probability of Profit (POP)
-    # Primary: Use log_range_mu/sigma from LightGBM model (same distribution used for strike placement)
-    # Fallback: GARCH-based lognormal (daily vol scaled to DTE)
+    # Primary: per-strike chain IV → N(d2) [risk-neutral P(expires OTM)]
+    # Secondary: log_range model breach_probability
+    # Tertiary: GARCH-based lognormal
     pop_pct = None
-    if log_range_mu is not None and log_range_sigma is not None and log_range_sigma > 0:
+    side = "put" if direction == "bull_put" else "call"
+    _strikes = oi_strikes or {}
+
+    # Primary — chain IV
+    strike_iv = _get_strike_iv(_strikes, short_strike, spot, side, atm_iv_fallback=None)
+    if strike_iv and strike_iv > 0.01:
+        from module4b_risk import pop_from_chain_iv
+        pop_pct = pop_from_chain_iv(short_strike, spot, dte_days, strike_iv, r, q, side)
+
+    # Secondary — log_range model
+    if pop_pct is None and log_range_mu is not None and log_range_sigma is not None and log_range_sigma > 0:
         try:
             from module4b_risk import breach_probability
-            side = "put" if direction == "bull_put" else "call"
             breach_p = breach_probability(short_strike, log_range_mu, log_range_sigma, spot, side)
             pop_pct = float(1 - breach_p)
         except Exception as e:
-            logger.warning(f"breach_probability call failed: {e}; will try GARCH fallback")
+            logger.warning(f"breach_probability failed: {e}")
 
+    # Tertiary — GARCH lognormal
     if pop_pct is None and garch_vol:
         garch_vol_for_dte = garch_vol * np.sqrt(max(dte_days, 1))
         if direction == 'bull_put':
             z = np.log(spot / short_strike) / garch_vol_for_dte
-            pop_pct = float(norm.cdf(z))
         else:
             z = np.log(short_strike / spot) / garch_vol_for_dte
-            pop_pct = float(norm.cdf(z))
+        pop_pct = float(norm.cdf(z))
 
-    # Step 8: Premium and Metrics
+    # Step 8: Premium — use per-strike IV for short leg; fall back to atm_iv + skew
     T_years = dte_days / 365.0
-    sigma_annual = atm_iv if (atm_iv and atm_iv > 0.05) else vix_level / 100.0
+    # Short-leg IV (chain primary, atm_iv fallback)
+    short_iv = _get_strike_iv(_strikes, short_strike, spot, side, atm_iv_fallback=None)
+    if not short_iv or short_iv < 0.05:
+        short_iv = atm_iv if (atm_iv and atm_iv > 0.05) else vix_level / 100.0
+
+    # Long-leg IV (chain primary, interpolated, atm_iv fallback)
+    long_side = side  # same option type for vertical spread
+    long_iv = _get_strike_iv(_strikes, long_strike, spot, long_side, atm_iv_fallback=None)
+    if not long_iv or long_iv < 0.05:
+        long_iv = short_iv  # conservative: same IV as short leg
+
     metrics = estimate_spread_premium(
-        spot, short_strike, long_strike, T_years, sigma_annual, r, direction, q,
-        vol_skew_factor=vol_skew_factor,
+        spot, short_strike, long_strike, T_years, short_iv, r, direction, q,
+        vol_skew_factor=0.0,  # skew already baked into per-strike IV
+        long_iv_override=long_iv,
     )
 
     # Step 9: Return
