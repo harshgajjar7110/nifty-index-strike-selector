@@ -57,6 +57,36 @@ def _safe_get(row, col, default):
         return float(row[col])
     return default
 
+def _get_strike_iv(
+    oi_strikes: dict,
+    strike: float,
+    spot: float,
+    side: str,
+    atm_iv_fallback: float | None = None,
+) -> float | None:
+    """Look up per-strike IV from chain. Interpolates between neighbours; falls back to atm_iv."""
+    iv_key = "put_iv" if side == "put" else "call_iv"
+    k = int(round(strike / 50) * 50)
+
+    # Direct lookup
+    row = oi_strikes.get(k, {})
+    iv = row.get(iv_key, 0.0)
+    if iv > 0.01:
+        return iv
+
+    # Linear interpolation between two nearest strikes with valid IV
+    ks = sorted(oi_strikes.keys())
+    lower = [x for x in ks if x < k and oi_strikes[x].get(iv_key, 0.0) > 0.01]
+    upper = [x for x in ks if x > k and oi_strikes[x].get(iv_key, 0.0) > 0.01]
+    if lower and upper:
+        k_lo, k_hi = lower[-1], upper[0]
+        iv_lo = oi_strikes[k_lo][iv_key]
+        iv_hi = oi_strikes[k_hi][iv_key]
+        frac = (k - k_lo) / (k_hi - k_lo)
+        return iv_lo + frac * (iv_hi - iv_lo)
+
+    return atm_iv_fallback
+
 NSE_EXPIRY_WEEKDAY = 1  # NSE Nifty 50 options expire on Tuesday (changed from Thursday ~2023)
 NIFTY_LOT_SIZE = 65    # NSE Nifty 50 lot size (as of 2024)
 
