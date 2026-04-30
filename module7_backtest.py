@@ -16,6 +16,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from loguru import logger
 
+from utils_constants import REGIMES
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -24,8 +26,6 @@ DATA_PATH = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
 WEEKLY_PATH = BASE_DIR / "data" / "nifty_weekly.parquet"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 
-# WING_WIDTH_POINTS is now dynamic (see generate_strikes() regime selection)
-# Standardized lot size loading
 LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
 SKEW_PTS_PER_PERCENT_IMBALANCE = 25  # empirical: 1% breach diff → 25 pts skew
 

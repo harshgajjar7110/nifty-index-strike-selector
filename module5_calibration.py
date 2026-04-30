@@ -1,6 +1,6 @@
 """
 Module 5: Conformal Calibration
-Wraps per-regime NGBoost models with MAPIE conformal prediction
+Wraps per-regime LightGBM models with MAPIE conformal prediction
 to provide guaranteed coverage bounds on predicted weekly range.
 """
 
@@ -13,8 +13,9 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from loguru import logger
 from dotenv import load_dotenv
-from scipy.stats import norm
 from sklearn.base import BaseEstimator, RegressorMixin
+
+from utils_constants import REGIMES
 
 BASE_DIR = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
@@ -51,7 +52,11 @@ class RegimeLGBQuantileWrapper(BaseEstimator, RegressorMixin):
         preds = np.zeros(len(X))
         for i, row in enumerate(X):
             vix = row[self.vix_col_idx]
-            regime = "low" if vix < self.low_thresh else ("mid" if vix < self.high_thresh else "high")
+            regime = (
+                "low" if vix < self.low_thresh
+                else "mid" if vix < self.high_thresh
+                else "high"
+            )
             if regime not in self.lgb_models:
                 logger.warning(f"No model for regime '{regime}' — using training median")
                 # Fallback to training median (roughly (P10+P90)/2)
@@ -99,7 +104,7 @@ def run_calibration() -> dict:
         regime_meta = json.load(f)
 
     lgb_models = {}
-    for regime in ["low", "mid", "high"]:
+    for regime in REGIMES:
         if regime in regime_meta:
             model_file = MODELS_DIR / regime_meta[regime]["model_file"]
             if model_file.exists():
@@ -146,7 +151,7 @@ def run_calibration() -> dict:
     # Build per-regime MAPIE models
     from mapie.regression import SplitConformalRegressor
 
-    regime_names = ["low", "mid", "high"]
+    regime_names = REGIMES
     thresholds = {"low": low_thresh, "high": high_thresh}
     mapie_per_regime = {}
     coverage_per_regime = {}

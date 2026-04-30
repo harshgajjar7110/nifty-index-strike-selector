@@ -21,7 +21,7 @@ from scipy.stats import norm
 from loguru import logger
 from dotenv import load_dotenv
 
-# Import from existing modules
+from utils_constants import REGIMES
 from module6_strikes import round_to_strike, _load_config, predict_range
 from module10_nse_costs import apply_slippage
 
@@ -32,15 +32,29 @@ BASE_DIR = Path(__file__).parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-NSE_HOLIDAYS: set[date] = {
-    # 2025
-    date(2025, 3, 8),   date(2025, 4, 11),  date(2025, 4, 14),
-    date(2025, 8, 15),  date(2025, 10, 2),  date(2025, 10, 20),
-    date(2025, 10, 21), date(2025, 11, 5),  date(2025, 12, 25),
-    # 2026
-    date(2026, 1, 1),   date(2026, 3, 26),  date(2026, 4, 3),
-    date(2026, 4, 14),  date(2026, 8, 15),  date(2026, 10, 2),
-}
+
+def _load_nse_holidays() -> set[date]:
+    """Load NSE holidays from JSON file; fallback to hardcoded defaults."""
+    holidays_path = BASE_DIR / "data" / "nse_holidays.json"
+    if holidays_path.exists():
+        try:
+            with open(holidays_path) as f:
+                data = json.load(f)
+                return {date.fromisoformat(d) for d in data.get("holidays", [])}
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Failed to load NSE holidays from JSON: {e}. Using fallback.")
+
+    # Hardcoded fallback (update data/nse_holidays.json for future years)
+    return {
+        date(2025, 3, 8),   date(2025, 4, 11),  date(2025, 4, 14),
+        date(2025, 8, 15),  date(2025, 10, 2),  date(2025, 10, 20),
+        date(2025, 10, 21), date(2025, 11, 5),  date(2025, 12, 25),
+        date(2026, 1, 1),   date(2026, 3, 26),  date(2026, 4, 3),
+        date(2026, 4, 14),  date(2026, 8, 15),  date(2026, 10, 2),
+    }
+
+
+NSE_HOLIDAYS: set[date] = _load_nse_holidays()
 
 # ---------------------------------------------------------------------------
 # Helpers

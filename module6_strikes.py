@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from loguru import logger
 from scipy.stats import norm
 
+from utils_constants import REGIMES
+
 try:
     from module4b_risk import breach_probability
 except ImportError:
@@ -47,10 +49,26 @@ def _load_regime_thresholds() -> tuple:
 
 _MODEL_CACHE: dict = {}
 
-def _load_models():
-    """Load per-regime LightGBM models, MAPIE models, and feature columns."""
-    if _MODEL_CACHE:
-        return _MODEL_CACHE["lgb"], _MODEL_CACHE["cols"], _MODEL_CACHE["mapie"], _MODEL_CACHE["mapie_global"]
+def _load_models(force_reload: bool = False):
+    """Load per-regime LightGBM models, MAPIE models, and feature columns.
+
+    Parameters
+    ----------
+    force_reload : bool
+        If True, reload models from disk (invalidate cache). Default False.
+    """
+    import time
+
+    # Check cache validity: return if valid and not forced reload
+    if _MODEL_CACHE and not force_reload:
+        cache_time = _MODEL_CACHE.get("_timestamp", 0)
+        # Check if any model files are newer than cache
+        meta_path = MODELS_DIR / "regime_model_meta.json"
+        if meta_path.exists() and meta_path.stat().st_mtime <= cache_time:
+            return _MODEL_CACHE["lgb"], _MODEL_CACHE["cols"], _MODEL_CACHE["mapie"], _MODEL_CACHE["mapie_global"]
+        elif not meta_path.exists():
+            # Metadata missing but cache exists — return cached (graceful fallback)
+            return _MODEL_CACHE["lgb"], _MODEL_CACHE["cols"], _MODEL_CACHE["mapie"], _MODEL_CACHE["mapie_global"]
 
     meta_path = MODELS_DIR / "regime_model_meta.json"
     if not meta_path.exists():
@@ -60,17 +78,17 @@ def _load_models():
         regime_meta = json.load(f)
 
     lgb_models = {}
-    for regime in ["low", "mid", "high"]:
+    for regime in REGIMES:
         if regime in regime_meta:
             model_file = MODELS_DIR / regime_meta[regime]["model_file"]
             if (MODELS_DIR / model_file.name).exists():
                 lgb_models[regime] = joblib.load(model_file)
 
     feature_columns = joblib.load(MODELS_DIR / "feature_columns.pkl")
-    
+
     # Load MAPIE models
     mapie_per_regime = {}
-    for regime in ["low", "mid", "high"]:
+    for regime in REGIMES:
         regime_path = MODELS_DIR / f"mapie_{regime}.pkl"
         if regime_path.exists():
             mapie_per_regime[regime] = joblib.load(regime_path)
@@ -86,6 +104,7 @@ def _load_models():
     _MODEL_CACHE["cols"] = feature_columns
     _MODEL_CACHE["mapie"] = mapie_per_regime
     _MODEL_CACHE["mapie_global"] = mapie_global
+    _MODEL_CACHE["_timestamp"] = time.time()
     return lgb_models, feature_columns, mapie_per_regime, mapie_global
 
 

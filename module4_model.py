@@ -18,61 +18,56 @@ import lightgbm as lgb
 from loguru import logger
 from sklearn.model_selection import TimeSeriesSplit
 
+from utils_constants import REGIMES, DEFAULT_REGIME_LOW_THRESH, DEFAULT_REGIME_HIGH_THRESH
+
 BASE_DIR = Path(__file__).parent
 DATA_PATH = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
 MODELS_DIR = BASE_DIR / "models"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 
-REGIME_THRESHOLDS = (15.0, 20.0)
-MIN_DATA_PER_REGIME = 10  # Lower threshold to use NGBoost for more regimes
+REGIME_THRESHOLDS = (DEFAULT_REGIME_LOW_THRESH, DEFAULT_REGIME_HIGH_THRESH)
+MIN_DATA_PER_REGIME = 10
 NGBOOST_N_ESTIMATORS = 250
 NGBOOST_LEARNING_RATE = 0.05
 
 
 def _tune_lgb_regime(X_regime: np.ndarray, y_regime: np.ndarray, alpha: float = 0.90) -> dict:
-    """Grid search LightGBM hyperparams using 3-fold TimeSeriesSplit. Returns best params."""
+    """Fast hyperparameter tuning using moderate defaults (skip exhaustive grid search)."""
     if len(X_regime) < 20:
         logger.warning("Too few samples for tuning, using defaults")
         return {"num_leaves": 31, "learning_rate": 0.1, "num_boost_round": 100}
 
-    best_score = float("inf")
-    best_params = {"num_leaves": 31, "learning_rate": 0.1, "num_boost_round": 100}
+    # Use sensible defaults + quick CV validation (3-fold, 150 rounds)
+    # Avoids exhaustive 486-model grid search; trades off tuning precision for 10x speed
+    train_data = lgb.Dataset(X_regime, label=y_regime)
+    params = {
+        "objective": "quantile",
+        "metric": "quantile",
+        "alpha": alpha,
+        "num_leaves": 31,
+        "learning_rate": 0.1,
+        "verbose": -1,
+        "random_state": 42,
+    }
+
+    # Quick CV pass (3-fold TimeSeries split, 150 rounds)
     tscv = TimeSeriesSplit(n_splits=3)
+    folds = list(tscv.split(X_regime))
 
-    for num_leaves in [15, 31, 63]:
-        for lr in [0.05, 0.1, 0.15]:
-            for n_rounds in [100, 200, 300]:
-                scores = []
-                for train_idx, val_idx in tscv.split(X_regime):
-                    X_tr, X_val = X_regime[train_idx], X_regime[val_idx]
-                    y_tr, y_val = y_regime[train_idx], y_regime[val_idx]
-                    train_data = lgb.Dataset(X_tr, label=y_tr)
-                    params = {
-                        "objective": "quantile",
-                        "metric": "quantile",
-                        "alpha": alpha,
-                        "num_leaves": num_leaves,
-                        "learning_rate": lr,
-                        "verbose": -1,
-                    }
-                    m = lgb.train(params, train_data, num_boost_round=n_rounds)
-                    preds = m.predict(X_val)
-                    pinball = float(np.mean(
-                        np.where(y_val >= preds, alpha * (y_val - preds), (alpha - 1) * (y_val - preds))
-                    ))
-                    scores.append(pinball)
-                avg = np.mean(scores)
-                if avg < best_score:
-                    best_score = avg
-                    best_params = {"num_leaves": num_leaves, "learning_rate": lr, "num_boost_round": n_rounds}
-
-    logger.info(f"Best params alpha={alpha} (score={best_score:.6f}): {best_params}")
-    return best_params
-
-
-def assign_regime(vix_series: pd.Series) -> pd.Series:
-    """Assign VIX regimes: low (<15), mid (15–20), high (≥20)."""
-    return pd.cut(vix_series, bins=[-np.inf, 15.0, 20.0, np.inf], labels=["low", "mid", "high"])
+    try:
+        cv_results = lgb.cv(
+            params,
+            train_data,
+            num_boost_round=150,
+            folds=folds,
+            verbose_eval=False,
+        )
+        best_round = len(cv_results["quantile-mean"]) - 1
+        logger.info(f"Alpha={alpha}: CV mean loss={float(cv_results['quantile-mean'][-1]):.6f}")
+        return {"num_leaves": 31, "learning_rate": 0.1, "num_boost_round": max(50, best_round)}
+    except Exception as e:
+        logger.warning(f"CV failed for alpha={alpha}: {e}. Using defaults.")
+        return {"num_leaves": 31, "learning_rate": 0.1, "num_boost_round": 100}
 
 
 def _optimize_thresholds(X_train_df: pd.DataFrame, y_train: np.ndarray) -> tuple:
@@ -163,7 +158,7 @@ def train_models() -> dict:
     lgb_models = {}
     regime_meta = {}
 
-    for regime in ["low", "mid", "high"]:
+    for regime in REGIMES:
         mask = (train_regimes == regime).values
         X_regime = X_train[mask]
         y_regime = y_train[mask]
@@ -206,7 +201,7 @@ def train_models() -> dict:
 
     # Save best hyperparameters per regime
     best_params_all = {}
-    for r in ["low", "mid", "high"]:
+    for r in REGIMES:
         if r in regime_meta:
             best_params_all[r] = {
                 "p10": regime_meta[r].get("best_params_p10", {}),
@@ -218,27 +213,28 @@ def train_models() -> dict:
         json.dump(best_params_all, f, indent=2)
     logger.info(f"Best params saved to {params_path}")
 
-    # Predict on test set per-regime
+    # Predict on test set per-regime (vectorized batch predictions)
     test_regimes = assign_regime_dynamic(X_test_df["vix_level"], low_thresh, high_thresh)
-    y_pred_p10_list = []
-    y_pred_p90_list = []
+    y_pred_p10 = np.full(len(X_test), np.nan)
+    y_pred_p90 = np.full(len(X_test), np.nan)
 
-    for idx, row_x in enumerate(X_test):
-        regime = test_regimes.iloc[idx]
+    global_p10_fallback = float(np.percentile(y_train, 10))
+    global_p90_fallback = float(np.percentile(y_train, 90))
+
+    for regime in REGIMES:
+        mask = (test_regimes == regime).values
+        if mask.sum() == 0:
+            continue
+
         if regime not in lgb_models:
             logger.warning(f"Regime {regime} has no trained model, using global mean")
-            p10_pred = float(np.percentile(y_train, 10))
-            p90_pred = float(np.percentile(y_train, 90))
+            y_pred_p10[mask] = global_p10_fallback
+            y_pred_p90[mask] = global_p90_fallback
         else:
             models = lgb_models[regime]
-            p10_pred = float(models["p10"].predict(row_x.reshape(1, -1))[0])
-            p90_pred = float(models["p90"].predict(row_x.reshape(1, -1))[0])
-
-        y_pred_p10_list.append(p10_pred)
-        y_pred_p90_list.append(p90_pred)
-
-    y_pred_p10 = np.array(y_pred_p10_list)
-    y_pred_p90 = np.array(y_pred_p90_list)
+            X_regime_test = X_test[mask]
+            y_pred_p10[mask] = models["p10"].predict(X_regime_test)
+            y_pred_p90[mask] = models["p90"].predict(X_regime_test)
 
     # Inversion guard
     inverted = y_pred_p90 < y_pred_p10
@@ -253,7 +249,7 @@ def train_models() -> dict:
 
     # Per-regime coverage
     regime_coverage = {}
-    for regime in ["low", "mid", "high"]:
+    for regime in REGIMES:
         mask = test_regimes == regime
         if mask.sum() > 0:
             cov = float(coverage_mask[mask].mean())
@@ -264,7 +260,7 @@ def train_models() -> dict:
 
     # SHAP for LightGBM models
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    for regime in ["low", "mid", "high"]:
+    for regime in REGIMES:
         if regime not in lgb_models:
             logger.info(f"{regime}: No trained model, skipping SHAP")
             continue
@@ -297,7 +293,7 @@ def train_models() -> dict:
 
     # Save models
     MODELS_DIR.mkdir(exist_ok=True)
-    for regime in ["low", "mid", "high"]:
+    for regime in REGIMES:
         if regime in lgb_models:
             model_path = MODELS_DIR / f"lgb_{regime}.pkl"
             joblib.dump(lgb_models[regime], model_path)

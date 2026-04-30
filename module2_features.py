@@ -160,17 +160,14 @@ def build_features() -> pd.DataFrame:
     # 4. Realized volatility from 5-min data
     # ------------------------------------------------------------------
     logger.info("Computing 5-min realized volatility...")
-    # Compute log returns within each trading date to avoid overnight gap contamination.
-    # Group by date, compute intra-session log returns (first bar of each session gets NaN
-    # and is dropped), then reassemble.
-    def _intraday_log_rets(grp: pd.DataFrame) -> pd.Series:
-        return np.log(grp["close"] / grp["close"].shift(1))
-
-    min5["log_ret"] = (
-        min5.groupby(min5.index.normalize(), group_keys=False)
-        .apply(_intraday_log_rets)
-    )
-    # Drop NaN entries (first bar of each session)
+    # Compute log returns per date, masking overnight gaps
+    min5["log_ret"] = np.log(min5["close"] / min5["close"].shift(1))
+    # Identify first bar of each trading day by checking if date changed
+    dates = min5.index.normalize().values
+    prev_dates = np.concatenate([np.array([np.datetime64("NaT")]), dates[:-1]])
+    is_first_bar = (dates != prev_dates)
+    min5.loc[is_first_bar, "log_ret"] = np.nan
+    # Compute realized vol per week from non-NaN returns
     rv_5min = (
         (min5["log_ret"].dropna() ** 2)
         .resample("W-FRI")

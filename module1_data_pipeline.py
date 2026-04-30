@@ -3,7 +3,6 @@ Module 1: Data Pipeline (yfinance — no API key required)
 Fetch, clean, and store historical OHLCV data using Yahoo Finance.
 """
 
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -138,6 +137,8 @@ def fetch_nifty_daily() -> pd.DataFrame:
         logger.warning("No new daily data returned.")
         return pd.read_parquet(NIFTY_DAILY_PATH) if NIFTY_DAILY_PATH.exists() else new_df
 
+    # Load existing data once (avoid TOCTOU race)
+    existing = None
     if NIFTY_DAILY_PATH.exists():
         existing = pd.read_parquet(NIFTY_DAILY_PATH)
         combined = pd.concat([existing, new_df])
