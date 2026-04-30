@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 # Import from existing modules
 from module6_strikes import round_to_strike, _load_config, predict_range
+from module10_nse_costs import apply_slippage
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -500,12 +501,25 @@ def generate_all_spreads(
                     atm_iv=atm_iv,
                     log_range_mu=range_pred.get("log_range_mu"),
                     log_range_sigma=range_pred.get("log_range_sigma"),
+                    oi_strikes=oi_strikes,
                 )
                 
                 spread["expiry_date"] = exp_dict["date"].isoformat()
                 spread["expiry_type"] = exp_dict["type"]
-                
-                # EV Proxy
+
+                # Net premium after slippage (2 legs per credit spread)
+                net_premium = apply_slippage(spread["premium_pts"], num_legs=2)
+                net_premium = max(net_premium, 0.0)
+                spread["net_premium_pts"]  = round(net_premium, 2)
+                spread["net_profit_inr"]   = round(net_premium * NIFTY_LOT_SIZE, 2)
+                spread["slippage_pts"]     = round(spread["premium_pts"] - net_premium, 2)
+
+                # RR and EV use net premium
+                spread["rr_ratio"] = round(
+                    net_premium / spread["max_loss_pts"], 4
+                ) if spread["max_loss_pts"] > 0 else 0.0
+
+                # EV Proxy using net premium
                 if spread["pop_pct"] is None:
                     logger.warning(
                         f"pop_pct unavailable for {spread['spread_type']} "
@@ -516,7 +530,7 @@ def generate_all_spreads(
                 else:
                     pop = spread["pop_pct"]
                 spread["ev_proxy"] = round(
-                    spread["premium_pts"] * pop - spread["max_loss_pts"] * (1 - pop), 4
+                    net_premium * pop - spread["max_loss_pts"] * (1 - pop), 4
                 )
                 
                 # Min RR check

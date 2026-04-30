@@ -62,6 +62,9 @@ def _print_spreads(spreads_result: dict, week_date: str) -> None:
               f"  |  Expiry: {s['expiry_date']} ({s['expiry_type']})  DTE={s['dte_days']}d")
         print(f"    Max Profit: {s['premium_pts']:.1f} pts  (₹{s['max_profit_inr']:,.0f})"
               f"  |  Max Loss: {s['max_loss_pts']:.1f} pts  (₹{s['max_loss_inr']:,.0f})")
+        net_prem = s.get("net_premium_pts", s['premium_pts'])
+        slip = s.get("slippage_pts", 0)
+        print(f"    Net Premium: {net_prem:.1f} pts  |  Slippage: {slip:.1f} pts")
         print(f"    R:R: {s['rr_ratio']:.2%}  |  POP: {pop*100:.1f}%"
               f"  |  Breakeven: {s['breakeven']:.0f}  |  EV: {s.get('ev_proxy',0):.4f}")
         print()
