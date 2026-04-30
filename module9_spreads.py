@@ -89,7 +89,7 @@ def _get_strike_iv(
     return atm_iv_fallback
 
 NSE_EXPIRY_WEEKDAY = 1  # NSE Nifty 50 options expire on Tuesday (changed from Thursday ~2023)
-NIFTY_LOT_SIZE = 65    # NSE Nifty 50 lot size (as of 2024)
+NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
 
 def _last_expiry_weekday_of_month(year: int, month: int) -> date:
     """Find the last NSE_EXPIRY_WEEKDAY of a given month."""
@@ -281,7 +281,11 @@ def detect_direction(feature_row: pd.Series) -> dict:
     }
     
     # Composite Score
-    weights = {"roc_score": 0.45, "vix_trend_score": 0.35, "garch_acc_score": 0.20}
+    roc_w = float(os.getenv("WEIGHT_ROC", "0.45"))
+    vix_w = float(os.getenv("WEIGHT_VIX", "0.35"))
+    garch_w = float(os.getenv("WEIGHT_GARCH", "0.20"))
+    
+    weights = {"roc_score": roc_w, "vix_trend_score": vix_w, "garch_acc_score": garch_w}
     composite = sum(signals[k] * w for k, w in weights.items())
     
     # Confidence (Event weeks reduce confidence)
@@ -385,14 +389,12 @@ def generate_credit_spread(
         except Exception as e:
             logger.warning(f"breach_probability failed: {e}")
 
-    # Tertiary — GARCH lognormal
+    # Tertiary — GARCH lognormal (unified via pop_from_chain_iv)
     if pop_pct is None and garch_vol:
-        garch_vol_for_dte = garch_vol * np.sqrt(max(dte_days, 1))
-        if direction == 'bull_put':
-            z = np.log(spot / short_strike) / garch_vol_for_dte
-        else:
-            z = np.log(short_strike / spot) / garch_vol_for_dte
-        pop_pct = float(norm.cdf(z))
+        from module4b_risk import pop_from_chain_iv
+        # Annualize the daily GARCH vol: garch_vol * sqrt(252)
+        garch_vol_annual = garch_vol * np.sqrt(252)
+        pop_pct = pop_from_chain_iv(short_strike, spot, dte_days, garch_vol_annual, r, q, side)
 
     # Step 8: Premium — use per-strike IV for short leg; fall back to atm_iv + skew
     T_years = dte_days / 365.0
@@ -405,7 +407,8 @@ def generate_credit_spread(
     long_side = side  # same option type for vertical spread
     long_iv = _get_strike_iv(_strikes, long_strike, spot, long_side, atm_iv_fallback=None)
     if not long_iv or long_iv < 0.05:
-        long_iv = short_iv  # conservative: same IV as short leg
+        # FIX: apply conservative vol skew (deeper OTM = higher IV)
+        long_iv = short_iv * 1.05 if short_iv else (atm_iv if atm_iv else vix_level/100.0)
 
     metrics = estimate_spread_premium(
         spot, short_strike, long_strike, T_years, short_iv, r, direction, q,
@@ -483,6 +486,24 @@ def generate_all_spreads(
     # regardless of the directional "opinion".
     spread_types = ["bull_put", "bear_call"]
     
+    # Step 3.5: Filter out low-DTE expiries (gamma risk)
+    min_dte_to_trade = int(os.getenv("MIN_DTE_TO_TRADE", "7"))
+    expiries_filtered = [e for e in expiries if e["dte"] >= min_dte_to_trade]
+
+    # Step 3.6: Augment with calendar fallback if only 1-2 expiries remain (need 3 for 6 spreads)
+    if len(expiries_filtered) < 3:
+        fallback_expiries = get_nse_expiries(date.today(), nse_expiry_list=None)  # Calendar-based
+        fallback_filtered = [e for e in fallback_expiries if e["dte"] >= min_dte_to_trade]
+        for fb in fallback_filtered:
+            if not any(e["date"] == fb["date"] for e in expiries_filtered):
+                expiries_filtered.append(fb)
+                logger.info(f"Added fallback expiry {fb['date']} ({fb['dte']}d, {fb['type']})")
+
+    expiries = expiries_filtered
+    if not expiries:
+        logger.warning(f"No expiries >= {min_dte_to_trade} DTE. Minimum DTE filter too strict.")
+        return {"generated_at": date.today().isoformat(), "spreads": [], "summary": {"total_spreads": 0}}
+
     # Step 4: Generate
     all_spreads = []
     for exp_dict in expiries:
@@ -541,16 +562,26 @@ def generate_all_spreads(
             except Exception as e:
                 logger.error(f"Failed to generate {s_type} for {exp_dict['date']}: {e}")
 
-    # Step 5: Rank
+    # Step 5: Rank by EV
     all_spreads.sort(key=lambda x: x["ev_proxy"], reverse=True)
 
-    # Feasibility filter: drop spreads that don't meet min RR
-    before_rr = len(all_spreads)
-    all_spreads = [s for s in all_spreads if s["meets_min_rr"]]
-    if len(all_spreads) < before_rr:
-        logger.info(f"Min RR filter: {before_rr} → {len(all_spreads)} spreads (min_rr={os.getenv('MIN_RR_RATIO', '0.15')})")
+    # Step 5.5: Hard RR and Premium filters
+    min_rr = float(os.getenv("MIN_RR_RATIO", "0.15"))
+    min_premium = float(os.getenv("MIN_PREMIUM_PTS", "20.0"))
 
-    # OI liquidity filter
+    for spread in all_spreads:
+        spread["meets_min_rr"] = bool(spread["rr_ratio"] >= min_rr)
+
+    pre_filter_count = len(all_spreads)
+    all_spreads = [
+        s for s in all_spreads
+        if s["rr_ratio"] >= min_rr and s["net_premium_pts"] >= min_premium
+    ]
+    dropped = pre_filter_count - len(all_spreads)
+    if dropped > 0:
+        logger.info(f"Hard filter: dropped {dropped} spreads (RR < {min_rr} or premium < {min_premium} pts)")
+
+    # Step 5.7: OI liquidity filter (if available; optional)
     if oi_strikes and min_oi > 0:
         def _liquid(strike: float) -> bool:
             k = int(round(strike / 50) * 50)
@@ -561,6 +592,12 @@ def generate_all_spreads(
         all_spreads = [s for s in all_spreads
                        if _liquid(s["short_strike"]) and _liquid(s["long_strike"])]
         logger.info(f"OI liquidity filter: {before} → {len(all_spreads)} spreads (min_oi={min_oi})")
+
+    # Step 5.8: Cap to top N spreads (default 6)
+    max_spreads_output = int(os.getenv("MAX_SPREADS_OUTPUT", "6"))
+    if len(all_spreads) > max_spreads_output:
+        logger.info(f"Limiting output to top {max_spreads_output} spreads by EV")
+        all_spreads = all_spreads[:max_spreads_output]
 
     # Step 6: Result
     result = {
