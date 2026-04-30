@@ -259,7 +259,7 @@ def detect_direction(feature_row: pd.Series) -> dict:
     Uses momentum (gap) and VIX trend.
     """
     # Load config from env
-    load_dotenv(dotenv_path=BASE_DIR / ".env")
+    load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
     threshold = float(os.getenv("DIRECTION_CONFIDENCE_THRESHOLD", 0.35))
     
     # Extract signals
@@ -328,8 +328,17 @@ def generate_credit_spread(
     log_range_mu: float | None = None,
     log_range_sigma: float | None = None,
     oi_strikes: dict | None = None,
+    pcr: float | None = None,
 ) -> dict:
     """Generate bull put or bear call strikes for a given expiry."""
+    # Step 0: PCR Skew
+    put_skew_pts, call_skew_pts = 0, 0
+    if pcr is not None:
+        from module6_strikes import compute_pcr_skew
+        put_skew_pts, call_skew_pts = compute_pcr_skew(pcr)
+        if put_skew_pts != 0 or call_skew_pts != 0:
+            logger.debug(f"PCR={pcr:.2f} → put_skew={put_skew_pts}, call_skew={call_skew_pts}")
+
     # Step 1: DTE Scaling Factor
     # sqrt(DTE/5): wider buffer/wing for longer-dated spreads (more time to breach)
     dte_scalar = np.sqrt(max(dte_days, 1) / 5.0)
@@ -360,10 +369,12 @@ def generate_credit_spread(
 
     # Step 6: Strike Placement
     if direction == 'bull_put':
-        short_strike = round_to_strike(spot - half_range_p90 - scaled_buffer)
+        # Apply put skew: negative = tighten (move closer to spot)
+        short_strike = round_to_strike(spot - half_range_p90 - scaled_buffer - put_skew_pts)
         long_strike = short_strike - scaled_wing
     else:
-        short_strike = round_to_strike(spot + half_range_p90 + scaled_buffer)
+        # Apply call skew: negative = tighten
+        short_strike = round_to_strike(spot + half_range_p90 + scaled_buffer + call_skew_pts)
         long_strike = short_strike + scaled_wing
 
     # Step 7: Probability of Profit (POP)
@@ -449,7 +460,7 @@ def generate_all_spreads(
     oi_data: dict | None = None,
 ) -> dict:
     """Orchestrate spread generation for 3 expiries."""
-    load_dotenv(dotenv_path=BASE_DIR / ".env")
+    load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
     if r is None:
         r = float(os.getenv("RISK_FREE_RATE", 0.065))
     if q is None:
@@ -523,6 +534,7 @@ def generate_all_spreads(
                     log_range_mu=range_pred.get("log_range_mu"),
                     log_range_sigma=range_pred.get("log_range_sigma"),
                     oi_strikes=oi_strikes,
+                    pcr=pcr,
                 )
                 
                 spread["expiry_date"] = exp_dict["date"].isoformat()

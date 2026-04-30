@@ -183,6 +183,20 @@ def run_live_pipeline() -> dict:
                     logger.info(f"OI loaded: PCR={oi_data['pcr']:.2f}  MaxPain={oi_data['max_pain']}")
         except Exception as e11:
             logger.warning(f"Option chain fetch failed (non-fatal): {e11} — GARCH-only mode")
+            # H7: Check for stale cache as fallback
+            try:
+                from module11_option_chain import CACHE_FILE
+                if CACHE_FILE.exists():
+                    cached = json.loads(CACHE_FILE.read_text())
+                    fetched_at = datetime.fromisoformat(cached.get("fetched_at", "2000-01-01"))
+                    age_min = (datetime.now() - fetched_at).total_seconds() / 60
+                    if age_min > 30:
+                        logger.error(f"OI cache is {age_min:.0f} min old — data may be stale")
+                    else:
+                        logger.warning(f"Using cached OI data ({age_min:.0f} min old)")
+                    oi_data = cached
+            except Exception as e_cache:
+                logger.debug(f"Cache fallback failed: {e_cache}")
 
         # ------------------------------------------------------------------
         # Step 6 — Credit Spreads (module9)
@@ -216,7 +230,7 @@ def run_live_pipeline() -> dict:
                     T_years=spread["dte_days"] / 365.0,
                     sigma=spread.get("atm_iv_pct", vix_level) / 100.0 if vix_level else 0.16,
                     spread_type=spread["spread_type"],
-                    lot_size=65,
+                    lot_size=int(os.getenv("NIFTY_LOT_SIZE", 65)),
                     capital_config=cap_cfg,
                 )
                 spread["capital_sizing"] = sizing

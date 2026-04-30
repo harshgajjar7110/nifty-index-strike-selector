@@ -245,6 +245,26 @@ def predict_range(feature_row: pd.Series) -> dict:
     }
 
 
+def compute_pcr_skew(pcr: float | None) -> tuple[int, int]:
+    """Returns (put_skew_pts, call_skew_pts) based on PCR.
+    Negative skew -> tighten (strike moves closer to spot - more premium).
+    """
+    if pcr is None:
+        return 0, 0
+    pcr_bear = float(os.getenv("PCR_BEAR_THRESHOLD", "0.80"))
+    pcr_bull = float(os.getenv("PCR_BULL_THRESHOLD", "1.20"))
+    put_tighten = int(os.getenv("PCR_PUT_TIGHTEN_PTS", "30"))
+    call_tighten = int(os.getenv("PCR_CALL_TIGHTEN_PTS", "30"))
+
+    if pcr < pcr_bear:
+        # Bearish market: put heavy buying -> tighten puts (negative = closer to spot)
+        return -put_tighten, 0
+    elif pcr > pcr_bull:
+        # Bullish market: call heavy -> tighten calls
+        return 0, -call_tighten
+    return 0, 0
+
+
 def generate_strikes(
     current_close: float,
     log_range_p10: float,
@@ -257,37 +277,18 @@ def generate_strikes(
     max_pain: float | None = None,
     log_range_mu: float | None = None,
     log_range_sigma: float | None = None,
+    pcr: float | None = None,
 ) -> dict:
     """
     Convert log-range predictions and current spot into iron condor strikes.
     Buffer is dynamically scaled based on VIX level.
     Put side can be widened (OTM) via put_skew_pts to reflect market skew.
     Call side can be widened (OTM) via call_skew_pts to reflect asymmetric skew.
-
-    Parameters
-    ----------
-    current_close : float
-        Current Nifty spot price.
-    log_range_p10 : float
-        Predicted P10 of log(H/L).
-    log_range_p90 : float
-        Predicted P90 of log(H/L).
-    vix_level : float | None
-        Current India VIX level. If None, fetches live via yfinance.
-    put_skew_pts : int
-        Extra OTM points for put strike. If 0 (default), uses value
-        from .env (PUT_SKEW_POINTS). If > 0, overrides config.
-    call_skew_pts : int
-        Extra OTM points for call strike. If 0 (default), uses value
-        from .env (CALL_SKEW_POINTS). If > 0, overrides config.
-    garch_vol_weekly : float | None
-        GARCH conditional volatility (weekly). If provided, computes
-        breach probabilities via lognormal model.
-
-    Returns
-    -------
-    dict with strike levels and metadata.
     """
+    if pcr is not None and put_skew_pts == 0 and call_skew_pts == 0:
+        put_skew_pts, call_skew_pts = compute_pcr_skew(pcr)
+        logger.debug(f"PCR={pcr:.2f} -> put_skew={put_skew_pts}, call_skew={call_skew_pts}")
+
     buffer_pts, wing_width_config, vix_baseline, loaded_put_skew, min_buffer_pts, loaded_call_skew = _load_config()
     # Use parameter if explicitly provided and non-zero, else use loaded config
     if put_skew_pts == 0:
@@ -305,11 +306,6 @@ def generate_strikes(
             logger.warning(f"Could not fetch live VIX: {e}, using baseline {vix_baseline:.2f}")
             vix_level = vix_baseline
 
-    # Trend Bias: If provided current_close is significantly different from Friday open,
-    # shift the distribution. Since we don't have open here, we can't do it perfectly,
-    # but we can check the momentum from features if passed.
-    # For now, we use asymmetric buffers if P10 and P90 suggest a skewed distribution.
-    
     # Select wing width based on VIX regime
     if vix_level < 15:
         wing_width = wing_width_config["low"]
@@ -345,13 +341,6 @@ def generate_strikes(
         f"scalar: {vix_scalar:.2f}, effective_buffer: {effective_buffer:.0f} pts"
     )
 
-    # ------------------------------------------------------------------
-    # ASYMMETRIC STRIKE PLACEMENT
-    # ------------------------------------------------------------------
-    # Use P10 to define the 'tight' inner range and P90 for the 'wide' outer range.
-    # We place short strikes at current_close +/- (weighted average of P10/P90)
-    # to account for both typical and extreme weekly ranges.
-    
     # log_range is ln(High/Low). Typical weekly range is ~2.5%.
     # half_range is roughly the distance from center to H or L.
     range_pts_p10 = current_close * (np.exp(log_range_p10) - 1)
@@ -366,14 +355,14 @@ def generate_strikes(
     short_put = round_to_strike(lower_price)
     short_call = round_to_strike(upper_price)
 
-    # Blend strikes 30% toward max pain (where option sellers are most hedged)
+    # Blend strikes 30% toward max pain
     if max_pain is not None:
         _MP_BLEND = 0.30
         short_put  = short_put  + _MP_BLEND * (max_pain - short_put)
         short_call = short_call + _MP_BLEND * (max_pain - short_call)
         short_put  = round_to_strike(short_put)
         short_call = round_to_strike(short_call)
-        logger.info(f"Max pain blend applied: max_pain={max_pain}, short_put→{short_put}, short_call→{short_call}")
+        logger.info(f"Max pain blend applied: max_pain={max_pain}, short_put->{short_put}, short_call->{short_call}")
 
     long_put = short_put - wing_width
     long_call = short_call + wing_width
@@ -393,15 +382,11 @@ def generate_strikes(
         )
     else:
         # Fallback: lognormal model using GARCH/ATM IV
-        # IMPORTANT: Correct for weekly time horizon (sqrt(5))
-        # atm_iv is annualized, garch_vol_weekly is daily mean
         weekly_vol_garch = garch_vol_weekly * np.sqrt(5) if garch_vol_weekly else None
         weekly_vol_iv    = atm_iv * np.sqrt(5 / 252) if (atm_iv and atm_iv > 0) else None
-        
         vol_for_pop = weekly_vol_iv if weekly_vol_iv else weekly_vol_garch
         
         if vol_for_pop is not None and vol_for_pop > 0:
-            # Probability(Price > Upper) or (Price < Lower) assuming lognormal
             z_call = np.log(short_call / current_close) / vol_for_pop
             z_put  = np.log(current_close / short_put)  / vol_for_pop
             breach_prob_call = float(1 - norm.cdf(z_call))
@@ -456,9 +441,8 @@ def fetch_live_spot() -> float:
 
     Returns
     -------
-    float — last traded price of Nifty 50
+    float - last traded price of Nifty 50
     """
-    import yfinance as yf
     ticker = yf.Ticker("^NSEI")
     spot = ticker.fast_info["last_price"]
     logger.info(f"Live Nifty spot (yfinance): {spot:.2f}")
@@ -469,15 +453,6 @@ def run_live_prediction(feature_row: pd.Series) -> dict:
     """
     End-to-end live prediction: predict range, fetch spot, generate strikes,
     save to outputs/strikes_YYYY-MM-DD.json.
-
-    Parameters
-    ----------
-    feature_row : pd.Series
-        Features matching the training feature set.
-
-    Returns
-    -------
-    dict — strikes result
     """
     range_pred = predict_range(feature_row)
     spot = fetch_live_spot()
