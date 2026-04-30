@@ -53,7 +53,13 @@ class RegimeLGBQuantileWrapper(BaseEstimator, RegressorMixin):
             vix = row[self.vix_col_idx]
             regime = "low" if vix < self.low_thresh else ("mid" if vix < self.high_thresh else "high")
             if regime not in self.lgb_models:
-                preds[i] = 0.0
+                logger.warning(f"No model for regime '{regime}' — using training median")
+                # Fallback to training median (roughly (P10+P90)/2)
+                preds[i] = np.median([
+                    (float(m["p10"].predict(row.reshape(1, -1))[0]) + 
+                     float(m["p90"].predict(row.reshape(1, -1))[0])) / 2.0
+                    for m in self.lgb_models.values()
+                ])
             else:
                 model = self.lgb_models[regime]
                 # Use P50 (median) as point prediction
@@ -124,9 +130,10 @@ def run_calibration() -> dict:
     X_calib_all = df_clean[available_features].iloc[split_idx:]
     y_calib_all = df_clean[target_col].iloc[split_idx:]
     n = len(X_calib_all)
-    mid = n // 2
+    mid = int(n * 0.80)  # Use 80% for conformalization, 20% for evaluation
     X_conf, y_conf = X_calib_all.iloc[:mid], y_calib_all.iloc[:mid]
     X_eval, y_eval = X_calib_all.iloc[mid:], y_calib_all.iloc[mid:]
+
     X_conf_arr = X_conf.values
     y_conf_arr = y_conf.values
     X_eval_arr = X_eval.values
@@ -136,77 +143,144 @@ def run_calibration() -> dict:
     low_thresh, high_thresh = _load_regime_thresholds()
     logger.info(f"Loaded regime thresholds: low={low_thresh}, high={high_thresh}")
 
-    # Build wrapper + fit MAPIE
-    wrapper = RegimeLGBQuantileWrapper(lgb_models, feature_columns, low_thresh, high_thresh)
+    # Build per-regime MAPIE models
     from mapie.regression import SplitConformalRegressor
 
-    mapie = SplitConformalRegressor(
-        estimator=wrapper,
+    regime_names = ["low", "mid", "high"]
+    thresholds = {"low": low_thresh, "high": high_thresh}
+    mapie_per_regime = {}
+    coverage_per_regime = {}
+
+    # Extract VIX column for masking
+    vix_col_idx = feature_columns.index("vix_level")
+
+    for regime in regime_names:
+        # Subset conformal and eval sets to this regime
+        if regime == "low":
+            mask_conf = X_conf_arr[:, vix_col_idx] < thresholds["low"]
+            mask_eval = X_eval_arr[:, vix_col_idx] < thresholds["low"]
+        elif regime == "mid":
+            mask_conf = (X_conf_arr[:, vix_col_idx] >= thresholds["low"]) & \
+                        (X_conf_arr[:, vix_col_idx] < thresholds["high"])
+            mask_eval = (X_eval_arr[:, vix_col_idx] >= thresholds["low"]) & \
+                        (X_eval_arr[:, vix_col_idx] < thresholds["high"])
+        else:  # high
+            mask_conf = X_conf_arr[:, vix_col_idx] >= thresholds["high"]
+            mask_eval = X_eval_arr[:, vix_col_idx] >= thresholds["high"]
+
+        X_r_conf, y_r_conf = X_conf_arr[mask_conf], y_conf_arr[mask_conf]
+        X_r_eval, y_r_eval = X_eval_arr[mask_eval], y_eval_arr[mask_eval]
+        logger.info(f"Regime {regime}: conf={len(X_r_conf)}, eval={len(X_r_eval)}")
+
+        if len(X_r_conf) < 7:
+            logger.warning(f"Regime {regime}: only {len(X_r_conf)} conf samples — skipping, using global fallback")
+            mapie_per_regime[regime] = None
+            coverage_per_regime[regime] = None
+            continue
+
+        wrapper_r = RegimeLGBQuantileWrapper(
+            lgb_models=lgb_models,
+            feature_columns=feature_columns,
+            low_thresh=low_thresh,
+            high_thresh=high_thresh,
+        )
+        mapie_r = SplitConformalRegressor(
+            estimator=wrapper_r,
+            confidence_level=target_coverage,
+            prefit=True,
+        )
+        mapie_r.conformalize(X_r_conf, y_r_conf)
+
+        if len(X_r_eval) >= 3:
+            y_pred_r, y_pis_r = mapie_r.predict_interval(X_r_eval)
+            # Handle different MAPIE versions
+            if len(y_pis_r.shape) == 3:
+                y_low_r = y_pis_r[:, 0, 0]
+                y_high_r = y_pis_r[:, 1, 0]
+            else:
+                y_low_r = y_pis_r[:, 0]
+                y_high_r = y_pis_r[:, 1]
+            covered_r = (y_low_r <= y_r_eval) & (y_r_eval <= y_high_r)
+            coverage_per_regime[regime] = float(np.mean(covered_r))
+            logger.info(f"Regime {regime} OOS coverage: {coverage_per_regime[regime]:.4f}")
+        else:
+            coverage_per_regime[regime] = None
+
+        mapie_per_regime[regime] = mapie_r
+
+    # Save per-regime MAPIE models
+    for regime, mapie_r in mapie_per_regime.items():
+        if mapie_r is not None:
+            out_path = MODELS_DIR / f"mapie_{regime}.pkl"
+            joblib.dump(mapie_r, out_path)
+            logger.info(f"Saved {regime} MAPIE to {out_path}")
+
+    # Save global fallback (original single MAPIE)
+    wrapper_global = RegimeLGBQuantileWrapper(
+        lgb_models=lgb_models,
+        feature_columns=feature_columns,
+        low_thresh=low_thresh,
+        high_thresh=high_thresh,
+    )
+    mapie_global = SplitConformalRegressor(
+        estimator=wrapper_global,
         confidence_level=target_coverage,
         prefit=True,
     )
-    mapie.conformalize(X_conf_arr, y_conf_arr)
-    logger.info("Fitted SplitConformalRegressor with RegimeLGBQuantileWrapper")
+    mapie_global.conformalize(X_conf_arr, y_conf_arr)
+    joblib.dump(mapie_global, MODELS_DIR / "mapie_calibrated.pkl")
+    logger.info("Saved global fallback MAPIE to mapie_calibrated.pkl")
 
-    # Compute coverage: LightGBM quantile models already provide intervals
-    # Use direct quantile predictions from test set (simpler than MAPIE wrapping)
-    def compute_coverage_direct() -> dict:
-        """Compute coverage using per-regime LightGBM P10/P90 predictions."""
-        y_pred_p10_list = []
-        y_pred_p90_list = []
-
-        # Get test data from full dataset
-        X_test = X[split_idx:]  # X is already numpy array
-        y_test = y[split_idx:]
-
-        vix_col_idx = available_features.index("vix_level")
-        for idx, row_x in enumerate(X_test):
-            vix = row_x[vix_col_idx]
-            regime = "low" if vix < low_thresh else ("mid" if vix < high_thresh else "high")
-            if regime not in lgb_models:
-                y_pred_p10_list.append(np.percentile(y[:split_idx], 10))
-                y_pred_p90_list.append(np.percentile(y[:split_idx], 90))
-            else:
-                models = lgb_models[regime]
-                p10 = float(models["p10"].predict(row_x.reshape(1, -1))[0])
-                p90 = float(models["p90"].predict(row_x.reshape(1, -1))[0])
-                y_pred_p10_list.append(p10)
-                y_pred_p90_list.append(p90)
-
-        y_pred_p10 = np.array(y_pred_p10_list)
-        y_pred_p90 = np.array(y_pred_p90_list)
-        half_width = (y_pred_p90 - y_pred_p10) / 2
-        mid = (y_pred_p10 + y_pred_p90) / 2
+    # Compute coverage: Use the evaluation set (X_eval_arr) which was NOT used for conformalization
+    def compute_coverage_mapie() -> dict:
+        """Compute coverage using fitted global MAPIE model on out-of-sample eval set."""
+        # Get intervals from MAPIE
+        y_pred, y_pis = mapie_global.predict_interval(X_eval_arr)
+        
+        # y_pis shape is (n_samples, 2, 1) in some MAPIE versions
+        if len(y_pis.shape) == 3:
+            y_low = y_pis[:, 0, 0]
+            y_high = y_pis[:, 1, 0]
+        else:
+            y_low = y_pis[:, 0]
+            y_high = y_pis[:, 1]
+        
+        covered = (y_low <= y_eval_arr) & (y_eval_arr <= y_high)
+        actual_coverage = np.mean(covered)
+        
+        half_width = (y_high - y_low) / 2
+        mid = (y_low + y_high) / 2
 
         return {
-            "coverage_80": _coverage_at_target(mid, half_width, y_test, 0.80),
-            "coverage_85": _coverage_at_target(mid, half_width, y_test, 0.85),
-            "coverage_90": _coverage_at_target(mid, half_width, y_test, 0.90),
+            "actual_coverage": float(actual_coverage),
             "_mid": mid,
             "_half_width": half_width,
-            "_y_test": y_test,
+            "_y_test": y_eval_arr,
         }
 
-    coverage_results = compute_coverage_direct()
-    coverage_80 = coverage_results["coverage_80"]
-    coverage_85 = coverage_results["coverage_85"]
-    coverage_90 = coverage_results["coverage_90"]
+    coverage_results = compute_coverage_mapie()
+    actual_coverage = coverage_results["actual_coverage"]
     _mid = coverage_results.pop("_mid")
     _half_width = coverage_results.pop("_half_width")
     _y_test = coverage_results.pop("_y_test")
 
-    logger.info(f"Empirical coverage @ 80%: {coverage_80:.4f}")
-    logger.info(f"Empirical coverage @ 85%: {coverage_85:.4f}")
-    logger.info(f"Empirical coverage @ 90%: {coverage_90:.4f}")
+    logger.info(f"Empirical OOS coverage @ {target_coverage:.0%}: {actual_coverage:.4f}")
 
-    for target, actual in [(0.80, coverage_80), (0.85, coverage_85), (0.90, coverage_90)]:
-        if actual < target:
-            logger.warning(f"Coverage {actual:.4f} is below target {target:.2f}")
+    if actual_coverage < target_coverage:
+        logger.warning(f"Coverage {actual_coverage:.4f} is below target {target_coverage:.2f}")
 
     # Calibration curve: compute real empirical coverage at each nominal level
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     nominal_levels = np.arange(0.70, 0.96, 0.05)
-    empirical_levels = [_coverage_at_target(_mid, _half_width, _y_test, lvl) for lvl in nominal_levels]
+    empirical_levels = []
+    for lvl in nominal_levels:
+        m = SplitConformalRegressor(estimator=wrapper_global, confidence_level=lvl, prefit=True)
+        m.conformalize(X_conf_arr, y_conf_arr)
+        _, pis = m.predict_interval(X_eval_arr)
+        if len(pis.shape) == 3:
+            low, high = pis[:, 0, 0], pis[:, 1, 0]
+        else:
+            low, high = pis[:, 0], pis[:, 1]
+        empirical_levels.append(np.mean((low <= y_eval_arr) & (y_eval_arr <= high)))
 
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.plot(nominal_levels, empirical_levels, "o-", color="steelblue",
@@ -227,16 +301,20 @@ def run_calibration() -> dict:
     plt.close(fig)
     logger.info(f"Saved calibration curve to {plot_path}")
 
-    # Save wrapper (MAPIE integration simplified for now)
+    # Save wrapper
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     wrapper_path = MODELS_DIR / "regime_lgb_wrapper.pkl"
-    joblib.dump(wrapper, wrapper_path)
+    joblib.dump(wrapper_global, wrapper_path)
     logger.info(f"Saved regime wrapper to {wrapper_path}")
 
     report = {
-        "coverage_at_80": round(coverage_80, 4) if not np.isnan(coverage_80) else None,
-        "coverage_at_85": round(coverage_85, 4) if not np.isnan(coverage_85) else None,
-        "coverage_at_90": round(coverage_90, 4) if not np.isnan(coverage_90) else None,
+        "target_coverage": target_coverage,
+        "actual_oos_coverage": round(actual_coverage, 4),
+        "per_regime_coverage": {k: round(v, 4) if v is not None else None for k, v in coverage_per_regime.items()},
+        "calibration_data": {
+            "nominal": [round(float(l), 2) for l in nominal_levels],
+            "empirical": [round(float(l), 4) for l in empirical_levels]
+        }
     }
 
     report_path = OUTPUTS_DIR / "calibration_report.json"

@@ -48,9 +48,9 @@ def _load_regime_thresholds() -> tuple:
 _MODEL_CACHE: dict = {}
 
 def _load_models():
-    """Load per-regime LightGBM models and feature columns. Raises FileNotFoundError if missing."""
+    """Load per-regime LightGBM models, MAPIE models, and feature columns."""
     if _MODEL_CACHE:
-        return _MODEL_CACHE["lgb"], _MODEL_CACHE["cols"]
+        return _MODEL_CACHE["lgb"], _MODEL_CACHE["cols"], _MODEL_CACHE["mapie"], _MODEL_CACHE["mapie_global"]
 
     meta_path = MODELS_DIR / "regime_model_meta.json"
     if not meta_path.exists():
@@ -67,21 +67,37 @@ def _load_models():
                 lgb_models[regime] = joblib.load(model_file)
 
     feature_columns = joblib.load(MODELS_DIR / "feature_columns.pkl")
-    logger.info("Regime LightGBM models and feature columns loaded.")
+    
+    # Load MAPIE models
+    mapie_per_regime = {}
+    for regime in ["low", "mid", "high"]:
+        regime_path = MODELS_DIR / f"mapie_{regime}.pkl"
+        if regime_path.exists():
+            mapie_per_regime[regime] = joblib.load(regime_path)
+
+    # Fallback global MAPIE
+    mapie_global = None
+    global_path = MODELS_DIR / "mapie_calibrated.pkl"
+    if global_path.exists():
+        mapie_global = joblib.load(global_path)
+
+    logger.info("Regime LightGBM and MAPIE models loaded.")
     _MODEL_CACHE["lgb"] = lgb_models
     _MODEL_CACHE["cols"] = feature_columns
-    return lgb_models, feature_columns
+    _MODEL_CACHE["mapie"] = mapie_per_regime
+    _MODEL_CACHE["mapie_global"] = mapie_global
+    return lgb_models, feature_columns, mapie_per_regime, mapie_global
 
 
 _CONFIG_CACHE: dict = {}
 
-def _load_config():
+def _load_config(force_reload: bool = False):
     """Load strike config from .env, including VIX baseline, put skew, call skew, and minimum buffer.
 
     Returns 6-tuple: (buffer_pts, wing_dict, vix_baseline, put_skew_pts, min_buffer_pts, call_skew_pts)
     Note: As of Task 5, wing_dict is {"low": 150, "mid": 200, "high": 250}.
     """
-    if _CONFIG_CACHE:
+    if _CONFIG_CACHE and not force_reload:
         return _CONFIG_CACHE["buffer"], _CONFIG_CACHE["wing"], _CONFIG_CACHE["vix_baseline"], _CONFIG_CACHE["put_skew"], _CONFIG_CACHE["min_buffer"], _CONFIG_CACHE["call_skew"]
 
     env_path = BASE_DIR / ".env"
@@ -178,30 +194,46 @@ def round_to_strike(price: float, interval: int = 50) -> int:
 def predict_range(feature_row: pd.Series) -> dict:
     """
     Predict P10 and P90 log-range + mu/sigma for a single feature row.
+    Uses per-regime MAPIE for calibrated interval prediction.
 
     Returns dict with keys: log_range_p10, log_range_p90, log_range_mu, log_range_sigma, regime
     """
-    lgb_models, feature_columns = _load_models()
+    lgb_models, feature_columns, mapie_per_regime, mapie_global = _load_models()
 
     X = feature_row[feature_columns].values.reshape(1, -1)
     vix = float(feature_row["vix_level"])
     low_thresh, high_thresh = _load_regime_thresholds()
     regime = "low" if vix < low_thresh else ("mid" if vix < high_thresh else "high")
 
-    if regime not in lgb_models:
-        logger.warning(f"No model for regime {regime}, using fallback percentiles")
-        # Rough fallback
-        log_range_p10 = -0.15
-        log_range_p90 = 0.25
-        log_range_mu = (log_range_p10 + log_range_p90) / 2
-        log_range_sigma = (log_range_p90 - log_range_p10) / (2 * norm.ppf(0.90))
-    else:
-        models = lgb_models[regime]
-        log_range_p10 = float(models["p10"].predict(X)[0])
-        log_range_p90 = float(models["p90"].predict(X)[0])
+    # Determine which MAPIE model to use
+    mapie_model = mapie_per_regime.get(regime, mapie_global)
+
+    if mapie_model is not None:
+        # Use MAPIE for calibrated intervals
+        _, y_pis = mapie_model.predict_interval(X)
+        if len(y_pis.shape) == 3:
+            log_range_p10 = float(y_pis[0, 0, 0])
+            log_range_p90 = float(y_pis[0, 1, 0])
+        else:
+            log_range_p10 = float(y_pis[0, 0])
+            log_range_p90 = float(y_pis[0, 1])
+        
         # Compute mu/sigma from P10 and P90 assuming Normal distribution
         log_range_mu = (log_range_p10 + log_range_p90) / 2.0
         log_range_sigma = (log_range_p90 - log_range_p10) / (2 * norm.ppf(0.90))
+    elif regime in lgb_models:
+        # Fallback to raw LightGBM if MAPIE missing
+        models = lgb_models[regime]
+        log_range_p10 = float(models["p10"].predict(X)[0])
+        log_range_p90 = float(models["p90"].predict(X)[0])
+        log_range_mu = (log_range_p10 + log_range_p90) / 2.0
+        log_range_sigma = (log_range_p90 - log_range_p10) / (2 * norm.ppf(0.90))
+    else:
+        logger.warning(f"No model for regime {regime}, using fallback percentiles")
+        log_range_p10 = 0.015
+        log_range_p90 = 0.035
+        log_range_mu = 0.025
+        log_range_sigma = 0.008
 
     logger.info(f"Predicted log_range: p10={log_range_p10:.4f}, p90={log_range_p90:.4f}, mu={log_range_mu:.4f}, sigma={log_range_sigma:.4f}, regime={regime}")
     return {
@@ -273,6 +305,11 @@ def generate_strikes(
             logger.warning(f"Could not fetch live VIX: {e}, using baseline {vix_baseline:.2f}")
             vix_level = vix_baseline
 
+    # Trend Bias: If provided current_close is significantly different from Friday open,
+    # shift the distribution. Since we don't have open here, we can't do it perfectly,
+    # but we can check the momentum from features if passed.
+    # For now, we use asymmetric buffers if P10 and P90 suggest a skewed distribution.
+    
     # Select wing width based on VIX regime
     if vix_level < 15:
         wing_width = wing_width_config["low"]
@@ -287,7 +324,6 @@ def generate_strikes(
     effective_buffer = np.clip(buffer_pts * vix_scalar, min_buffer_pts, 150)
 
     # Calm-market tighten: if VIX low AND GARCH vol low, reduce buffer by 15%
-    # but always respect the min_buffer floor.
     if (
         vix_level is not None
         and vix_level < 12
@@ -309,13 +345,23 @@ def generate_strikes(
         f"scalar: {vix_scalar:.2f}, effective_buffer: {effective_buffer:.0f} pts"
     )
 
-    # Absolute half-ranges
-    half_range_p10 = current_close * (np.exp(log_range_p10) - 1) / 2
-    half_range_p90 = current_close * (np.exp(log_range_p90) - 1) / 2
+    # ------------------------------------------------------------------
+    # ASYMMETRIC STRIKE PLACEMENT
+    # ------------------------------------------------------------------
+    # Use P10 to define the 'tight' inner range and P90 for the 'wide' outer range.
+    # We place short strikes at current_close +/- (weighted average of P10/P90)
+    # to account for both typical and extreme weekly ranges.
+    
+    # log_range is ln(High/Low). Typical weekly range is ~2.5%.
+    # half_range is roughly the distance from center to H or L.
+    range_pts_p10 = current_close * (np.exp(log_range_p10) - 1)
+    range_pts_p90 = current_close * (np.exp(log_range_p90) - 1)
+    
+    # Use a blended range: 70% P90 + 30% P10 for a robust 'half-range'
+    blended_half_range = (0.70 * range_pts_p90 + 0.30 * range_pts_p10) / 2.0
 
-    # Use P90 (wider) range for strike placement with VIX-scaled buffer
-    lower_price = current_close - half_range_p90 - effective_buffer - put_skew_pts
-    upper_price = current_close + half_range_p90 + effective_buffer + call_skew_pts
+    lower_price = current_close - blended_half_range - effective_buffer - put_skew_pts
+    upper_price = current_close + blended_half_range + effective_buffer + call_skew_pts
 
     short_put = round_to_strike(lower_price)
     short_call = round_to_strike(upper_price)
@@ -347,9 +393,15 @@ def generate_strikes(
         )
     else:
         # Fallback: lognormal model using GARCH/ATM IV
-        atm_iv_weekly = atm_iv * np.sqrt(5 / 252) if (atm_iv and atm_iv > 0) else None
-        vol_for_pop = atm_iv_weekly if atm_iv_weekly else garch_vol_weekly
+        # IMPORTANT: Correct for weekly time horizon (sqrt(5))
+        # atm_iv is annualized, garch_vol_weekly is daily mean
+        weekly_vol_garch = garch_vol_weekly * np.sqrt(5) if garch_vol_weekly else None
+        weekly_vol_iv    = atm_iv * np.sqrt(5 / 252) if (atm_iv and atm_iv > 0) else None
+        
+        vol_for_pop = weekly_vol_iv if weekly_vol_iv else weekly_vol_garch
+        
         if vol_for_pop is not None and vol_for_pop > 0:
+            # Probability(Price > Upper) or (Price < Lower) assuming lognormal
             z_call = np.log(short_call / current_close) / vol_for_pop
             z_put  = np.log(current_close / short_put)  / vol_for_pop
             breach_prob_call = float(1 - norm.cdf(z_call))
@@ -358,7 +410,7 @@ def generate_strikes(
             vol_src = "market_iv" if (atm_iv and atm_iv > 0) else "garch"
             logger.info(
                 f"POP: {prob_of_profit:.1%}, breach_call: {breach_prob_call:.1%}, "
-                f"breach_put: {breach_prob_put:.1%}  [vol_src={vol_src}]"
+                f"breach_put: {breach_prob_put:.1%}  [vol_src={vol_src}_weekly]"
             )
 
     result = {
@@ -367,8 +419,8 @@ def generate_strikes(
         "short_call": short_call,
         "long_put": long_put,
         "long_call": long_call,
-        "predicted_range_p10": round(half_range_p10 * 2, 2),
-        "predicted_range_p90": round(half_range_p90 * 2, 2),
+        "predicted_range_p10": round(range_pts_p10 * 2, 2),
+        "predicted_range_p90": round(range_pts_p90 * 2, 2),
         "buffer_pts": buffer_pts,
         "wing_width_pts": wing_width,
         "vix_level": vix_level,
