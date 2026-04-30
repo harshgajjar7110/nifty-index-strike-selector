@@ -43,11 +43,18 @@ def _data_exists() -> bool:
 
 
 def _models_exist() -> bool:
-    return (
-        (BASE_DIR / "models" / "lgb_low.pkl").exists()
-        and (BASE_DIR / "models" / "lgb_mid.pkl").exists()
-        and (BASE_DIR / "models" / "lgb_high.pkl").exists()
-    )
+    required_files = [
+        "lgb_low.pkl",
+        "lgb_mid.pkl",
+        "lgb_high.pkl",
+        "feature_columns.pkl",
+        "regime_thresholds.json",
+        "regime_model_meta.json",
+        "regime_lgb_wrapper.pkl",
+        "mapie_calibrated.pkl",
+        "garch_model.pkl"
+    ]
+    return all((BASE_DIR / "models" / f).exists() for f in required_files)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,8 +92,8 @@ def mode_setup():
     garch_df = run_garch_pipeline()
     logger.success(f"M3 done — {len(garch_df)} rows with GARCH features.")
 
-    # M4: Train NGBoost regime models
-    _step("M4 — Training NGBoost per-regime models (low/mid/high VIX)")
+    # M4: Train LightGBM regime models
+    _step("M4 — Training LightGBM per-regime models (low/mid/high VIX)")
     from module4_model import train_models
     eval_results = train_models()
     coverage = eval_results.get("coverage_rate", 0)
@@ -97,13 +104,13 @@ def mode_setup():
     _step("M5 — Conformal calibration (MAPIE)")
     from module5_calibration import run_calibration
     cal_report = run_calibration()
-    logger.success(f"M5 done — Coverage @85%: {cal_report.get('coverage_at_85', '?')}")
+    target_cov = cal_report.get('target_coverage', 0.85)
+    logger.success(f"M5 done — Coverage @{target_cov:.0%}: {cal_report.get('actual_oos_coverage', '?')}")
 
     print("\n" + "═"*60)
     print("  SETUP COMPLETE")
-    print(f"  Coverage @80%: {cal_report.get('coverage_at_80', '?')}")
-    print(f"  Coverage @85%: {cal_report.get('coverage_at_85', '?')}")
-    print(f"  Coverage @90%: {cal_report.get('coverage_at_90', '?')}")
+    print(f"  Target Coverage : {cal_report.get('target_coverage', '?')}")
+    print(f"  Actual OOS Cov  : {cal_report.get('actual_oos_coverage', '?')}")
     print("  → Run backtest:  python run_pipeline.py --mode backtest")
     print("  → Get strikes:   python run_pipeline.py --mode live")
     print("═"*60 + "\n")

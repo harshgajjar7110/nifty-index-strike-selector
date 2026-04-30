@@ -25,7 +25,8 @@ WEEKLY_PATH = BASE_DIR / "data" / "nifty_weekly.parquet"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 
 # WING_WIDTH_POINTS is now dynamic (see generate_strikes() regime selection)
-LOT_SIZE = 25              # Nifty lot size (₹ per point)
+# Standardized lot size loading
+LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
 SKEW_PTS_PER_PERCENT_IMBALANCE = 25  # empirical: 1% breach diff → 25 pts skew
 
 # ---------------------------------------------------------------------------
@@ -285,14 +286,15 @@ def run_backtest() -> dict:
             # Total loss = (Entry Net Premium) - (3 * Theoretical Entry Premium)
             # This reflects exiting when the leg price triples
             gross_pnl = entry_premium_net - (SL_MULTIPLIER * premium_pts)
-            # Cap loss at wing width if SL is wider than wings (rare for 3x)
-            gross_pnl = max(gross_pnl, -max_loss_pts - (4 * SLIPPAGE_EXIT))
+            # Cap loss at maximum possible
+            gross_pnl = min(gross_pnl, -(max_loss_pts + (4 * SLIPPAGE_EXIT)))
 
         # 3. Apply NSE Transaction Costs
         # Entry charges (Sell side)
         entry_charges = calculate_nse_charges(premium_pts, num_legs=4, is_sell=True)
         # Exit charges (Buy side or expiry settlement)
-        exit_charges = calculate_nse_charges(premium_pts if not won else 0, num_legs=4, is_sell=False)
+        # On loss, use max_loss_pts as proxy for exit turnover; on win, use premium_pts
+        exit_charges = calculate_nse_charges(max_loss_pts if not won else premium_pts, num_legs=4, is_sell=False)
         
         total_charges_pts = entry_charges["cost_per_lot_pts"] + exit_charges["cost_per_lot_pts"]
         net_pnl = gross_pnl - total_charges_pts - (4 * SLIPPAGE_EXIT) # Exit slippage
@@ -313,7 +315,7 @@ def run_backtest() -> dict:
     results["txn_costs_pts"] = costs_list
 
     # Drop weeks where actual_log_range was unavailable
-    valid = results.dropna(subset=["pnl_points"])
+    valid = results.dropna(subset=["pnl_points"]).reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # 5. Metrics

@@ -175,7 +175,19 @@ def fetch_option_chain(expiry_date: date | None = None) -> dict | None:
     if expiry_date is None:
         if expiry_dates:
             # expiry_dates list is '28-Apr-2026' format
-            expiry_date = datetime.strptime(expiry_dates[0], "%d-%b-%Y").date()
+            from datetime import date as _date
+            today = _date.today()
+            parsed = []
+            for s in expiry_dates:
+                try:
+                    parsed.append(datetime.strptime(s, "%d-%b-%Y").date())
+                except ValueError:
+                    pass
+            future = [d for d in parsed if d > today]
+            if not future:
+                logger.error("OI: no future expiry dates found")
+                return None
+            expiry_date = min(future)
         else:
             logger.error("OI: no expiry dates in response")
             return None

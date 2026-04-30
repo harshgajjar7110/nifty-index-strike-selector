@@ -68,6 +68,7 @@ def _load_csv_if_exists() -> pd.DataFrame | None:
     """Load Nifty 50 data from local CSV if it exists."""
     csv_path = DATA_DIR / "Nifty 50 Historical Data.csv"
     if not csv_path.exists():
+        logger.warning(f"Historical CSV not found at {csv_path}. Using Yahoo Finance fallback for all history.")
         return None
 
     logger.info(f"Loading historical data from {csv_path.name}")

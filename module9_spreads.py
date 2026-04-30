@@ -579,7 +579,19 @@ def generate_all_spreads(
 
     # Step 5.5: Hard RR and Premium filters
     min_rr = float(os.getenv("MIN_RR_RATIO", "0.15"))
-    min_premium = float(os.getenv("MIN_PREMIUM_PTS", "20.0"))
+    
+    # Regime-specific premium floor
+    from module6_strikes import _load_regime_thresholds
+    low_thresh, high_thresh = _load_regime_thresholds()
+    
+    if vix_level < low_thresh:
+        min_premium = float(os.getenv("MIN_PREMIUM_LOW_VIX_PTS", "15.0"))
+    elif vix_level < high_thresh:
+        min_premium = float(os.getenv("MIN_PREMIUM_MID_VIX_PTS", "25.0"))
+    else:
+        min_premium = float(os.getenv("MIN_PREMIUM_HIGH_VIX_PTS", "40.0"))
+
+    logger.info(f"VIX={vix_level:.1f} → hard filters: RR >= {min_rr}, premium >= {min_premium} pts")
 
     for spread in all_spreads:
         spread["meets_min_rr"] = bool(spread["rr_ratio"] >= min_rr)

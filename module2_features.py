@@ -118,7 +118,7 @@ def build_features() -> pd.DataFrame:
             low=("low", "min"),
             close=("close", "last"),
             volume=("volume", "sum"),
-        )
+        ).dropna(subset=["open", "close"])
 
     # ------------------------------------------------------------------
     # 2. ATR features (daily, resampled to weekly last value)
@@ -201,7 +201,7 @@ def build_features() -> pd.DataFrame:
     rv_combined.name = "realized_vol_5min"         # keep column name consistent
     rv_5min = rv_combined                          # replace sparse series with filled one
 
-    rv_ann = rv_5min * np.sqrt(52)
+    rv_ann = rv_5min * np.sqrt(252)
     vix_aligned, rv_aligned = vix_weekly.align(rv_ann, join="left")
     vrp = vix_aligned / 100 - rv_aligned
     vrp.name = "vol_risk_premium"
@@ -282,18 +282,19 @@ def build_features() -> pd.DataFrame:
     # 14. Merge all features
     # ------------------------------------------------------------------
     logger.info("Merging all features...")
+    # LAGGING: Most features must be shifted by 1 to represent state at START of week
     frames = [
-        atr5, atr14, atr21,
-        park_weekly, gk_weekly,
-        rv_5min,
-        vix_weekly, vix_change, vrp,
-        range_1w, range_4w_avg,
-        prev_week_gap,
-        bb_width,
-        return_4w,
-        vol_skew,
-        vix_zscore,
-        is_event,
+        atr5.shift(1), atr14.shift(1), atr21.shift(1),
+        park_weekly.shift(1), gk_weekly.shift(1),
+        rv_5min.shift(1),
+        vix_weekly.shift(1), vix_change.shift(1), vrp.shift(1),
+        range_1w.shift(1), range_4w_avg.shift(1),
+        prev_week_gap.shift(1),
+        bb_width.shift(1),
+        return_4w.shift(1),
+        vol_skew.shift(1),
+        vix_zscore.shift(1),
+        is_event.shift(1),
         log_range,
     ]
 

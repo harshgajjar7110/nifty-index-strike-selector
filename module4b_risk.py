@@ -55,10 +55,26 @@ def cvar(mu: float, sigma: float, alpha: float = 0.05) -> float:
     return mu + sigma * phi_z / alpha
 
 
+import json
+from pathlib import Path
+
+_THRESH_PATH = Path(__file__).parent / "models" / "regime_thresholds.json"
+
+def _load_thresholds():
+    """Load optimized regime thresholds from file."""
+    if _THRESH_PATH.exists():
+        try:
+            d = json.loads(_THRESH_PATH.read_text())
+            return d.get("low_thresh", 15.0), d.get("high_thresh", 20.0)
+        except Exception:
+            pass
+    return 15.0, 20.0
+
 def regime_risk_report(test_df, ngb_models: dict, feature_columns: list) -> dict:
     """Per-regime risk summary from NGB models and test data."""
     report = {}
-    vix_thresholds = {"low": (0, 15), "mid": (15, 20), "high": (20, float('inf'))}
+    _low_t, _high_t = _load_thresholds()
+    vix_thresholds = {"low": (0, _low_t), "mid": (_low_t, _high_t), "high": (_high_t, float('inf'))}
 
     for regime, (vix_min, vix_max) in vix_thresholds.items():
         # Filter by VIX regime
@@ -84,16 +100,17 @@ def regime_risk_report(test_df, ngb_models: dict, feature_columns: list) -> dict
 
         for idx, row in regime_df.iterrows():
             X_row = row[feature_columns].values.reshape(1, -1)
-            dist = model.pred_dist(X_row)
-            mu_row = dist.loc[0]
-            sigma_row = dist.scale[0]
-
+            
+            # Use LightGBM P10/P90 to derive mu and sigma
+            # P10 = mu - 1.28*sigma, P90 = mu + 1.28*sigma
+            p10 = float(model["p10"].predict(X_row)[0])
+            p90 = float(model["p90"].predict(X_row)[0])
+            
+            mu_row = (p10 + p90) / 2.0
+            sigma_row = (p90 - p10) / 2.563  # 2 * 1.2815
+            
             mus.append(mu_row)
             sigmas.append(sigma_row)
-
-            # Compute P10, P90 from the distribution
-            p10 = sp_norm.ppf(0.10, loc=mu_row, scale=sigma_row)
-            p90 = sp_norm.ppf(0.90, loc=mu_row, scale=sigma_row)
 
             # Check coverage: actual log_range within [P10, P90]
             actual_log_range = row["log_range"]

@@ -40,14 +40,18 @@ def run_garch_pipeline() -> pd.DataFrame:
     logger.info("Fitting GJR-GARCH(1,1,1) with skewed-t distribution...")
     model = arch_model(returns, vol="Garch", p=1, o=1, q=1, dist="skewt")
     result = model.fit(disp="off")
+    if result.convergence_flag != 0:
+        logger.warning(f"GARCH model did not converge (flag={result.convergence_flag}). Results may be unstable.")
     logger.info("GJR-GARCH model fitted successfully")
 
     # 4. Extract conditional volatility and convert back from percentage
     cond_vol = result.conditional_volatility / 100
 
-    # 5. Aggregate to weekly (W-FRI)
-    weekly_mean = cond_vol.resample("W-FRI").mean().rename("garch_sigma_mean")
-    weekly_max = cond_vol.resample("W-FRI").max().rename("garch_sigma_max")
+    # 5. Aggregate to weekly (W-FRI) and LAG by 1 week
+    # This ensures that for the row indexed Friday T, we use volatility from week T-1
+    # to predict log_range of week T.
+    weekly_mean = cond_vol.resample("W-FRI").mean().rename("garch_sigma_mean").shift(1)
+    weekly_max = cond_vol.resample("W-FRI").max().rename("garch_sigma_max").shift(1)
     garch_weekly = pd.concat([weekly_mean, weekly_max], axis=1)
     garch_weekly.index.name = "week_end"
     logger.info(f"Aggregated GARCH vol to {len(garch_weekly)} weekly observations")

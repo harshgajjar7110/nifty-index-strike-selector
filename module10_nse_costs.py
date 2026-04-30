@@ -10,9 +10,9 @@ from loguru import logger
 def calculate_nse_charges(
     premium_pts: float,
     num_legs: int = 4,
-    lot_size: int = 25,
+    lot_size: int = 65,
     is_sell: bool = True,
-    brokerage_per_order: float = 20.0
+    brokerage_per_order: float | None = None
 ) -> dict:
     """
     Calculate total transaction costs for an NSE Options trade.
@@ -28,6 +28,9 @@ def calculate_nse_charges(
     is_sell : bool
         Whether this is the entry (sell) or exit (buy/expiry).
     """
+    if brokerage_per_order is None:
+        brokerage_per_order = float(os.getenv("BROKERAGE_PER_TRADE_INR", "20.0"))
+    
     turnover = premium_pts * lot_size
     
     # 1. Brokerage (₹20 per executed order/leg)

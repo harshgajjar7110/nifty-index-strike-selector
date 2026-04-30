@@ -6,6 +6,7 @@ Regimes: low (<15), mid (15–20), high (≥20).
 
 from pathlib import Path
 import json
+import os
 import numpy as np
 import pandas as pd
 import joblib
@@ -120,6 +121,23 @@ def train_models() -> dict:
     feature_columns = list(X.columns)
     logger.info(f"Features: {len(feature_columns)} | Columns: {feature_columns} | Target rows: {len(y)}")
 
+    # Load per-regime quantile alphas from env (configurable)
+    regime_alphas = {
+        "low": (
+            float(os.getenv("ALPHA_LOW_P10", "0.10")),
+            float(os.getenv("ALPHA_LOW_P90", "0.90"))
+        ),
+        "mid": (
+            float(os.getenv("ALPHA_MID_P10", "0.15")),
+            float(os.getenv("ALPHA_MID_P90", "0.85"))
+        ),
+        "high": (
+            float(os.getenv("ALPHA_HIGH_P10", "0.10")),
+            float(os.getenv("ALPHA_HIGH_P90", "0.90"))
+        ),
+    }
+    logger.info(f"Regime alphas: {regime_alphas}")
+
     # Time-series split
     n = len(df)
     split = int(n * 0.80)
@@ -150,25 +168,26 @@ def train_models() -> dict:
         X_regime = X_train[mask]
         y_regime = y_train[mask]
         n_regime = len(X_regime)
+        alpha_lower, alpha_upper = regime_alphas[regime]
 
-        logger.info(f"Training {regime} regime ({n_regime} rows)...")
+        logger.info(f"Training {regime} regime ({n_regime} rows) with alphas {alpha_lower}/{alpha_upper}...")
 
         if n_regime >= MIN_DATA_PER_REGIME:
             # Tune separately — P10 and P90 can prefer different tree depths
-            best_p10 = _tune_lgb_regime(X_regime, y_regime, alpha=0.10)
-            best_p90 = _tune_lgb_regime(X_regime, y_regime, alpha=0.90)
+            best_p10 = _tune_lgb_regime(X_regime, y_regime, alpha=alpha_lower)
+            best_p90 = _tune_lgb_regime(X_regime, y_regime, alpha=alpha_upper)
             train_data = lgb.Dataset(X_regime, label=y_regime)
 
             base_params = {"objective": "quantile", "metric": "quantile", "verbose": -1}
 
             # Train P10 model
-            p10_params = {**base_params, "alpha": 0.10,
+            p10_params = {**base_params, "alpha": alpha_lower,
                           "num_leaves": best_p10["num_leaves"],
                           "learning_rate": best_p10["learning_rate"]}
             lgb_p10 = lgb.train(p10_params, train_data, num_boost_round=best_p10["num_boost_round"])
 
             # Train P90 model
-            p90_params = {**base_params, "alpha": 0.90,
+            p90_params = {**base_params, "alpha": alpha_upper,
                           "num_leaves": best_p90["num_leaves"],
                           "learning_rate": best_p90["learning_rate"]}
             lgb_p90 = lgb.train(p90_params, train_data, num_boost_round=best_p90["num_boost_round"])
@@ -220,6 +239,12 @@ def train_models() -> dict:
 
     y_pred_p10 = np.array(y_pred_p10_list)
     y_pred_p90 = np.array(y_pred_p90_list)
+
+    # Inversion guard
+    inverted = y_pred_p90 < y_pred_p10
+    if inverted.sum() > 0:
+        logger.warning(f"{inverted.sum()} rows have P90 < P10 — clamping")
+        y_pred_p10 = np.minimum(y_pred_p10, y_pred_p90)
 
     # Evaluate overall coverage
     coverage_mask = (y_pred_p10 <= y_test) & (y_test <= y_pred_p90)
