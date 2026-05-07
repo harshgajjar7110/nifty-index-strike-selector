@@ -1,83 +1,110 @@
 # Nifty 50 Iron Condor Strategy Engine
 
-ML-powered system for **conservative strike placement** in weekly/short-duration iron condor options trading on Nifty 50 (Indian stock index). Uses NGBoost regime models + GARCH volatility + conformal prediction for **calibrated probability guarantees**.
+ML-powered system for **conservative strike placement** in weekly iron condor options trading on Nifty 50 (Indian stock index). Uses per-VIX-regime LightGBM quantile models + GARCH volatility + macro features + conformal prediction for **calibrated probability guarantees**.
 
 ## Quick Start
 
 ```bash
-# Setup (download 5yr data, train models, calibrate)
+# First-time setup (downloads 5yr data, engineers features, trains models, calibrates)
 python run_pipeline.py --mode setup
 
-# Backtest historical performance
+# Static backtest (80/20 train/test split)
 python run_pipeline.py --mode backtest
+
+# Expanding-window walk-forward backtest (periodic retrain, most realistic)
+python run_pipeline.py --mode walkforward
 
 # Generate this week's strikes (Sunday night)
 python run_pipeline.py --mode live
 
-# Retrain models on latest data
+# Retrain models on latest data (monthly)
 python run_pipeline.py --mode retrain
+
+# Fetch US/global macro data
+python run_pipeline.py --mode macro
+
+# Check model drift & coverage decay
+python run_pipeline.py --mode monitor
 ```
 
 ## Features
 
-✅ **VIX-Aware Strike Placement** — Buffer scales dynamically based on current volatility (high VIX → wider, more conservative strikes)
-
-✅ **Asymmetric Put Skew** — Put side widened to reflect NSE market premium for downside protection
-
-✅ **Breach Probability Modeling** — Uses GARCH conditional volatility + lognormal CDF to compute actual breach risk (not just distance)
-
-✅ **Conformal Prediction** — Guaranteed ≥85% coverage on prediction intervals (MAPIE calibration)
-
-✅ **Walk-Forward Backtest** — Historical P&L simulation with equity curve, Sharpe ratio, max drawdown
-
-✅ **Live Orchestration** — Single command updates all data, retrains GARCH, generates strikes every Sunday
-
-✅ **Directional Credit Spreads** — Generates Bull Put and Bear Call spreads across weekly and monthly expiries with DTE-aware scaling and EV ranking
+- **VIX-Aware Strike Placement** — Buffer scales dynamically based on current volatility (high VIX → wider, more conservative strikes)
+- **Macro Feature Integration** — US VIX, S&P 500 returns, crude oil, USD/INR, US 10Y yields merged into feature matrix
+- **Per-Regime LightGBM Quantile Models** — Separate P10/P90 models for low/mid/high VIX regimes
+- **Conformal Prediction (MAPIE)** — Empirical coverage calibration on out-of-sample data
+- **Static + Walk-Forward Backtests** — Compare idealized vs. realistic out-of-sample performance
+- **Model Drift Monitor** — Automated alerts for coverage decay, feature drift, and win-rate degradation
+- **Live Orchestration** — Single command fetches latest data, recomputes features, generates strikes
 
 ## Architecture
 
 ```
 Data Pipeline (M1)
-    ↓ (5yr daily OHLCV, intraday, VIX)
+    ↓ (5yr daily OHLCV, intraday, India VIX)
 Feature Engineering (M2)
-    ↓ (ATR, volatility, Bollinger Bands, range)
+    ↓ (ATR, volatility, Bollinger Bands, range, macro features)
 GARCH Volatility (M3)
-    ↓ (conditional σ(t) weekly)
-NGBoost Regime Models (M4)
-    ↓ (per-VIX-regime: low/mid/high, Normal distribution, 80/20 train/test split)
+    ↓ (GJR-GARCH(1,1,1) conditional σ(t) weekly)
+LightGBM Regime Models (M4)
+    ↓ (per-VIX-regime: low/mid/high, quantile regression P10/P90)
 Conformal Calibration (M5)
     ↓ (MAPIE empirical coverage guarantee)
 Strike Generation (M6) ←→ Backtester (M7)
     ↓                          ↓
 Live Pipeline (M8)         Equity Curve + Metrics
     ↓
-Credit Spreads (M9)
+Walk-Forward Backtest (M7b)
+    ↓
+Model Drift Monitor (M13)
 ```
 
+### New Modules
+
+| Module | Purpose |
+|--------|---------|
+| `module1b_macro.py` | Fetch US VIX, SPX, crude, USD/INR, US 10Y from Yahoo Finance; build weekly macro features |
+| `module7b_walkforward.py` | Expanding-window walk-forward backtest with periodic retrain every 4 weeks |
+| `module13_monitor.py` | Coverage decay detection, rolling win-rate alerts, KS feature drift tests |
+| `config.py` | Pydantic `BaseSettings` with range validation and convenience properties |
 
 ## Configuration
 
-All settings in `.env` (auto-loads or inherits sensible defaults):
+All settings in `.env` (auto-loads via `python-dotenv`):
 
 ```env
 # Strike buffer (points) — scaled by VIX dynamically
-STRIKE_BUFFER_POINTS=50
+STRIKE_BUFFER_POINTS=100
+MIN_BUFFER_POINTS=100
 
-# Iron condor wing width (short to long strike)
-WING_WIDTH_POINTS=200
+# Wing widths per VIX regime
+WING_WIDTH_LOW_VIX=300
+WING_WIDTH_MID_VIX=400
+WING_WIDTH_HIGH_VIX=500
 
-# Baseline VIX for scaling (if not set, computed from 52-week historical mean)
-# VIX_BASELINE=16.0
+# Quantile alphas per regime (configurable via .env)
+ALPHA_LOW_P10=0.10
+ALPHA_LOW_P90=0.90
+ALPHA_MID_P10=0.15
+ALPHA_MID_P90=0.85
+ALPHA_HIGH_P10=0.10
+ALPHA_HIGH_P90=0.90
 
-# Put skew: extra OTM points for short put (0 = symmetric)
-# Calibrate from backtest results; typical range 0-150 pts
-PUT_SKEW_POINTS=0
+# Walk-forward settings
+WF_INITIAL_TRAIN_WEEKS=120
+WF_RETRAIN_EVERY_WEEKS=4
+WF_CALIBRATION_WEEKS=40
+WF_SL_MULTIPLIER=3.0
+WF_MAX_VIX_TRADE=22
+WF_MIN_PREMIUM_PTS=20
 
-# Base premium collected per trade (scaled per-row by VIX in backtest)
-PREMIUM_POINTS_BASE=80
-
-# Conformal prediction coverage target
+# Target coverage for conformal calibration
 TARGET_COVERAGE=0.85
+
+# Monitor thresholds
+MONITOR_COVERAGE_DECAY=0.05
+MONITOR_DRIFT_WINDOW_WEEKS=12
+MONITOR_FEATURE_DRIFT_PVAL=0.01
 ```
 
 ## Usage Examples
@@ -87,89 +114,88 @@ TARGET_COVERAGE=0.85
 ```bash
 python run_pipeline.py --mode live
 # Output: strikes_live.json with short put, short call, long put, long call
-# POP: 65-72% depending on VIX
 ```
 
-### 2-3 Day Put Spreads (Trending Down Days)
-
-On high-VIX, trending-down days:
-1. Widen wing to 250-300 pts (in `.env` or code)
-2. Set `PUT_SKEW_POINTS=50-100` (higher skew on trending days)
-3. Implement 60% profit exit (not hold-to-expiry)
-4. Skip entry on earnings/announcement days
-
-**Expected metrics:**
-- Win rate: 55-65% (vs 70-75% for weekly)
-- POP: 60-68% depending on VIX and spread width
-- Theta: ~60-70% captured in 2-3 days
-
-### Backtesting & Calibration
+### Backtesting
 
 ```bash
+# Static backtest (fast, 80/20 split)
 python run_pipeline.py --mode backtest
+
+# Walk-forward backtest (slower, more realistic — periodic retrain)
+python run_pipeline.py --mode walkforward
 ```
 
 Generates:
-- `outputs/backtest_equity_curve.png` — cumulative P&L + POP overlay
-- `outputs/backtest_results.csv` — per-week details
-- `outputs/backtest_summary.json` — metrics:
-  - `win_rate_pct` — % weeks both strikes held
-  - `sharpe_ratio` — risk-adjusted returns (annualized)
-  - `max_drawdown_points` — peak-to-trough loss
-  - `avg_pop_pct` — average Prob of Profit
-  - `breach_rate_up_pct`, `breach_rate_down_pct` — asymmetry
-  - `recommended_put_skew_pts` — calibrated from breach imbalance
+- `outputs/backtest_equity_curve.png` / `outputs/walkforward_equity_curve.png`
+- `outputs/backtest_results.csv` / `outputs/walkforward_results.csv`
+- `outputs/backtest_summary.json` / `outputs/walkforward_summary.json`
 
-Use calibration to tune `.env`:
+Key metrics:
+- `win_rate_pct` — % weeks Nifty closed within [short_put, short_call]
+- `sharpe_ratio` — risk-adjusted returns (annualized)
+- `max_drawdown_points` — peak-to-trough equity decline
+- `breach_rate_low_vix_pct` / `mid` / `high` — breach rate by regime
+
+### Model Health Check
+
+```bash
+python run_pipeline.py --mode monitor
 ```
-If breach_rate_down > breach_rate_up by 5% → set PUT_SKEW_POINTS = 125
-If win rate < 65% → increase STRIKE_BUFFER_POINTS or WING_WIDTH_POINTS
-```
+
+Checks:
+- Coverage decay vs. target
+- Rolling 8-week win rate
+- Feature distribution drift (Kolmogorov-Smirnov)
+- POP prediction accuracy
+
+Outputs `outputs/monitor_report_YYYY-MM-DD.json` with `RETRAIN` / `REVIEW_FEATURES` / `OK` recommendation.
 
 ## Strike Placement Logic
 
-**Given:** Current spot, P10/P90 predictions, VIX level, GARCH volatility
+**Given:** Current spot, P10/P90 log-range predictions, VIX level, GARCH volatility
 
 **Process:**
 
-1. **Buffer Scaling:**
+1. **Regime Assignment:**
+   ```
+   low  = VIX < low_thresh   (default ~14)
+   mid  = low_thresh ≤ VIX < high_thresh (default ~14–18)
+   high = VIX ≥ high_thresh
+   ```
+
+2. **Quantile Prediction:**
+   ```
+   log_range_p10 = LightGBM_p10.predict(feature_row)
+   log_range_p90 = LightGBM_p90.predict(feature_row)
+   ```
+
+3. **Buffer Scaling:**
    ```
    vix_scalar = current_vix / vix_baseline
-   effective_buffer = clamp(buffer_pts * vix_scalar, [30, 150])
+   effective_buffer = clamp(buffer_pts * vix_scalar, min_buffer_pts, 150)
    ```
 
-2. **Range Calculation:**
+4. **Range → Strikes:**
    ```
-   half_range_p90 = spot * (exp(log_range_p90) - 1) / 2
+   range_pts_p10 = spot * (exp(log_range_p10) - 1)
+   range_pts_p90 = spot * (exp(log_range_p90) - 1)
+   blended_half_range = (0.70 * range_pts_p90 + 0.30 * range_pts_p10) / 2.0
+
+   short_put  = round_to_50(spot - blended_half_range - effective_buffer - put_skew)
+   short_call = round_to_50(spot + blended_half_range + effective_buffer + call_skew)
+   long_put   = short_put - wing_width
+   long_call  = short_call + wing_width
    ```
 
-3. **Asymmetric Placement:**
+5. **Breach Probability:**
    ```
-   short_put = round_to_50(spot - half_range_p90 - effective_buffer - put_skew_pts)
-   short_call = round_to_50(spot + half_range_p90 + effective_buffer)  [no skew]
+   log_range_mu    = (p10 + p90) / 2
+   log_range_sigma = (p90 - p10) / (2 * z_0.90)
+   breach_prob_call = 1 - Φ((ln(short_call/spot) - mu) / sigma)
+   breach_prob_put  = Φ((ln(short_put/spot) - mu) / sigma)
+   POP = 1 - breach_call - breach_put
    ```
-
-4. **Breach Probability (via NGBoost regime model):**
-   
-   NGBoost outputs (μ, σ) for weekly log-range from regime-specific Normal distribution.
-   ```
-   # Convert strike to log-range threshold
-   half_range_needed = (strike - spot) / spot
-   log_range_needed = ln(1.0 + 2.0 * half_range_needed)
-   
-   # Probability of breach
-   breach_prob_call = 1 - Φ((log_range_needed - μ) / σ)
-   breach_prob_put = Φ((-log_range_needed - μ) / σ)
-   prob_of_profit = 1 - breach_prob_call - breach_prob_put
-   
-   # CVaR (tail risk at 95%/99%)
-   cvar_95 = μ + σ * φ(z_0.05) / 0.05
-   cvar_99 = μ + σ * φ(z_0.01) / 0.01
-   ```
-   
-   Regime assignment: low (VIX<15) / mid (15≤VIX<20) / high (VIX≥20).
-
-**Output:** JSON with strikes, predicted range, VIX-aware metrics, breach probabilities
 
 ## Data Files
 
@@ -179,27 +205,33 @@ If win rate < 65% → increase STRIKE_BUFFER_POINTS or WING_WIDTH_POINTS
 | `data/nifty_weekly.parquet` | OHLCV | Weekly aggregation |
 | `data/india_vix_daily.parquet` | close | India VIX history |
 | `data/nifty_intraday.parquet` | OHLCV | 1h bars (~730 days) |
+| `data/macro_daily.parquet` | OHLCV | US/global macro data |
 | `data/feature_matrix.parquet` | features | Engineered features per week |
-| `data/feature_matrix_with_garch.parquet` | +σ | With GARCH conditional volatility |
-| `models/ngb_low.pkl` | serialized | NGBoost model (VIX < 15) |
-| `models/ngb_mid.pkl` | serialized | NGBoost model (15 ≤ VIX < 20) |
-| `models/ngb_high.pkl` | serialized | NGBoost model (VIX ≥ 20) |
-| `models/regime_model_meta.json` | metadata | Model sources & training sizes per regime |
-| `models/feature_columns.pkl` | list | Feature names (training) |
-| `models/mapie_calibrated.pkl` | serialized | Conformal calibrator (MAPIE) |
+| `data/feature_matrix_with_garch.parquet` | +σ | With GARCH + macro merged |
+| `models/lgb_low.pkl` | serialized | LightGBM quantile models (VIX < low_thresh) |
+| `models/lgb_mid.pkl` | serialized | LightGBM quantile models (mid regime) |
+| `models/lgb_high.pkl` | serialized | LightGBM quantile models (VIX ≥ high_thresh) |
+| `models/mapie_calibrated.pkl` | serialized | Global MAPIE conformal calibrator |
+| `models/mapie_low.pkl` | serialized | Per-regime MAPIE (fallback) |
+| `models/garch_model.pkl` | serialized | Fitted GJR-GARCH model |
+| `models/regime_model_meta.json` | metadata | Model sources & training sizes |
+| `models/feature_columns.pkl` | list | Feature names (training order) |
 
 ## Key Files
 
-- **`run_pipeline.py`** — Master orchestrator (4 modes: setup, backtest, live, retrain)
+- **`run_pipeline.py`** — Master orchestrator (7 modes: setup, backtest, walkforward, live, macro, monitor, retrain)
+- **`config.py`** — Pydantic `BaseSettings` with validation
 - **`module1_data_pipeline.py`** — Fetch & aggregate OHLCV (yfinance)
-- **`module2_features.py`** — Feature engineering (ATR, volatility, VIX, calendar)
-- **`module3_garch.py`** — GARCH(1,1) conditional volatility
-- **`module4_model.py`** — NGBoost regime models (low/mid/high VIX) with Normal distribution output
-- **`module4b_risk.py`** — Risk calculations (breach_probability, CVaR, per-regime stats)
+- **`module1b_macro.py`** — Fetch US/global macro data
+- **`module2_features.py`** — Feature engineering (ATR, volatility, VIX, macro merge)
+- **`module3_garch.py`** — GJR-GARCH(1,1,1) conditional volatility
+- **`module4_model.py`** — LightGBM per-regime quantile models (P10/P90)
 - **`module5_calibration.py`** — MAPIE conformal calibration
-- **`module6_strikes.py`** — Strike generation logic (core)
-- **`module7_backtest.py`** — Walk-forward P&L simulation
-- **`module8_live.py`** — Sunday-night live runner (entry point)
+- **`module6_strikes.py`** — Strike generation logic
+- **`module7_backtest.py`** — Static walk-forward P&L simulation
+- **`module7b_walkforward.py`** — Expanding-window walk-forward with periodic retrain
+- **`module8_live.py`** — Sunday-night live runner
+- **`module13_monitor.py`** — Drift & coverage monitoring
 
 ## Installation
 
@@ -213,115 +245,77 @@ pip install -r requirements.txt
 **Key Dependencies:**
 - `pandas`, `numpy`, `pyarrow` — data handling
 - `arch`, `scipy`, `statsmodels` — GARCH, statistics
-- `ngboost`, `scikit-learn`, `shap` — ML (regime-aware boosting + explainability)
+- `lightgbm`, `scikit-learn`, `shap` — ML (quantile regression + explainability)
 - `MAPIE` — conformal prediction
 - `yfinance` — free market data (no API key)
-- `python-dotenv`, `loguru` — config + logging
+- `pydantic`, `python-dotenv`, `loguru` — config + logging
 
 ## Validation
 
-### Test on Mock VIX Scenarios
-
-Create extreme-VIX test to verify scaling:
-
-```python
-from module6_strikes import generate_strikes
-
-for vix in [5, 10, 16, 25, 40]:
-    strikes = generate_strikes(
-        current_close=24000,
-        log_range_p10=0.0230,
-        log_range_p90=0.0600,
-        vix_level=vix,
-        garch_vol_weekly=0.035
-    )
-    print(f"VIX={vix}: PUT={strikes['short_put']}, CALL={strikes['short_call']}, "
-          f"Buffer={strikes['effective_buffer_pts']:.0f}, POP={strikes['prob_of_profit']*100:.1f}%")
-```
-
-**Expected behavior:**
-- ✅ Buffer scales 30→140+ pts
-- ✅ Strikes widen OTM as VIX rises
-- ✅ POP improves (higher) with conservative placement
-- ✅ Width increases with VIX
-
-### Backtest Validation
+### Backtest Targets
 
 ```bash
 python run_pipeline.py --mode backtest
-cat outputs/backtest_summary.json | grep -E "win_rate|sharpe|breach"
+python run_pipeline.py --mode walkforward
 ```
 
-Target metrics:
-- Win rate: 70-75% (weekly) or 55-65% (2-3 day)
-- Sharpe: 1.5+ (annual)
-- Max drawdown: <500 pts
-- Coverage: 85%+
+| Metric | Static Backtest | Walk-Forward |
+|--------|----------------|--------------|
+| Win rate | ~96% | ~91% |
+| Sharpe | ~0.82 | ~0.44 |
+| Max drawdown | ~421 pts | ~1,090 pts |
+| Expectancy/trade | ~8.7 pts | ~5.5 pts |
+
+> **Note:** Walk-forward is the more realistic benchmark because it simulates live retraining and out-of-sample prediction. The gap between static and walk-forward (~5pp win rate) quantifies overfitting.
+
+### Tuning Guide
+
+```
+If win rate < 85% in walk-forward → increase STRIKE_BUFFER_POINTS or widen quantile alphas
+If coverage < 80% in monitor → retrain models or increase buffer
+If breach_rate_high_vix > 20% → lower WF_MAX_VIX_TRADE or widen wing width
+If premium < 20 pts consistently → reduce buffer or tighten wing width
+```
 
 ## Worst-Case Scenarios
 
 1. **Gap Limit-Down** (>250 pts) → Full loss if exceeds wing width
 2. **Earnings Collision** → Gap 300-500 pts on announcement
-3. **Geopolitical Shock** (war escalation) → 5-10% move + IV crush = premium decay halts
+3. **Geopolitical Shock** → 5-10% move + IV crush
 4. **Liquidity Evaporation** → Can't exit emergency position
-5. **GARCH Model Failure** → Volatility regime shift (distribution tail fatter than expected)
+5. **Model Drift** → Feature distributions shift (caught by monitor)
 6. **Weekend Gap** → Can't exit Friday-to-Monday move
 
 **Mitigations:**
-- Skip entry on earnings weeks
-- Monitor economic calendar for events
+- Skip entry on VIX > 22 (`WF_MAX_VIX_TRADE`)
+- Skip entry on premium < 20 pts (`WF_MIN_PREMIUM_PTS`)
 - Position size: max loss = 1-2% capital per trade
-- Add hard stop: exit if intraday move >3σ
-- Check bid-ask spread before entry (skip if >20 pts)
-
-## Strategy Notes
-
-### Weekly Iron Condors
-- Holds 5-7 days until Thursday expiry
-- Win rate: 70-75%
-- Slower theta decay but more time for error recovery
-
-### 2-3 Day Put Spreads (Trending Days)
-- Directional (puts only), short premium
-- Win rate: 55-65% (vs 70-75% weekly)
-- Faster capital rotation, higher gap risk
-- Best on trending-down days with high VIX (volatility amplifies put premium)
-
-**Tuning for 2-3 Day Spreads:**
-- Increase `WING_WIDTH_POINTS` to 250-300 pts on gap-risk days
-- Set `PUT_SKEW_POINTS = 50-100` (market pays premium for downside protection during high IV)
-- Implement 60% profit exit instead of hold-to-expiry
-- Exit immediately if intraday VIX spike (>25% move) or 3σ price move
+- Run monitor weekly after expiry
+- Retrain monthly: `python run_pipeline.py --mode retrain`
 
 ## Monitoring & Maintenance
 
-### Daily Checks (if deployed)
-- Monitor option bid-ask spreads (NSE liquidity)
-- Check for surprise earnings/events
-- Track realized vs. predicted range
-
 ### Weekly (After Expiry)
-- Review P&L vs. backtest expectations
-- Check equity curve trend
-- Compare realized vol to GARCH forecast
+- Run monitor: `python run_pipeline.py --mode monitor`
+- Review `outputs/monitor_report_*.json`
+- Check `outputs/backtest_equity_curve.png` for trend degradation
 
-### Monthly (or After Market Regime Change)
+### Monthly (or After Regime Change)
 - Retrain models: `python run_pipeline.py --mode retrain`
-- Recalibrate skew from `recommended_put_skew_pts`
-- Audit GARCH fit quality
-- Review SHAP importance (feature drift?)
+- Review SHAP importance (`outputs/shap_importance_*.png`) for feature drift
+- Check calibration curve (`outputs/calibration_curve.png`)
+
+### After Major Market Events
+- Re-fetch macro data: `python run_pipeline.py --mode macro`
+- Full pipeline retrain if monitor flags `RETRAIN`
 
 ## Disclaimers
 
-⚠️ **Research Project** — Not intended as investment advice. Backtests assume:
-- Perfect execution (no slippage, instant fills)
-- No transaction costs
-- No circuit breakers or exchange halts
-- Historical patterns continue (overfitting risk)
+⚠️ **Research Project** — Not intended as investment advice. Backtests assume realistic but not perfect execution.
 
-⚠️ **Market Risk** — Options trading has unlimited downside (short calls) or near-total loss (short puts + wide gaps). Position sizing critical.
+⚠️ **Market Risk** — Options trading has significant downside. Position sizing critical.
 
-⚠️ **Model Risk** — NGBoost assumes Normal distribution for weekly log-range; real market tails fatter. CVaR 95%/99% provide tail risk estimates but may underestimate in extreme regimes (VIX spikes, earnings gaps).
+⚠️ **Model Risk** — LightGBM quantile models assume continuity; real market tails are fatter. Conformal prediction widens intervals empirically but may still underestimate in unprecedented regimes.
 
 ## License
 
@@ -329,8 +323,8 @@ MIT License — Use freely. Attribution appreciated.
 
 ## Author
 
-Built for conservative options traders targeting 2-3 day theta decay + VIX-aware risk management.
+Built for conservative options traders targeting weekly theta decay + VIX-aware risk management.
 
 ---
 
-**Questions?** Check CLAUDE.md for development notes or module docstrings for API details.
+**Questions?** Check `CLAUDE.md` for development notes or module docstrings for API details.

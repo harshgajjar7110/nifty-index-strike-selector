@@ -17,10 +17,12 @@ import shap
 import lightgbm as lgb
 from loguru import logger
 from sklearn.model_selection import TimeSeriesSplit
+from dotenv import load_dotenv
 
 from utils_constants import REGIMES, DEFAULT_REGIME_LOW_THRESH, DEFAULT_REGIME_HIGH_THRESH
 
 BASE_DIR = Path(__file__).parent
+load_dotenv(dotenv_path=BASE_DIR / ".env")
 DATA_PATH = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
 MODELS_DIR = BASE_DIR / "models"
 OUTPUTS_DIR = BASE_DIR / "outputs"
@@ -60,7 +62,6 @@ def _tune_lgb_regime(X_regime: np.ndarray, y_regime: np.ndarray, alpha: float = 
             train_data,
             num_boost_round=150,
             folds=folds,
-            verbose_eval=False,
         )
         best_round = len(cv_results["quantile-mean"]) - 1
         logger.info(f"Alpha={alpha}: CV mean loss={float(cv_results['quantile-mean'][-1]):.6f}")

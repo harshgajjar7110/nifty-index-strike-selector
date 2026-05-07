@@ -4,8 +4,11 @@ Nifty 50 Iron Condor — Master Pipeline
 Single entry point for all modes:
 
   python run_pipeline.py --mode setup       # First-time: fetch data + train + calibrate
-  python run_pipeline.py --mode backtest    # Validate historical performance
+  python run_pipeline.py --mode backtest    # Static 80/20 backtest
+  python run_pipeline.py --mode walkforward # True expanding-window backtest (periodic retrain)
   python run_pipeline.py --mode live        # Sunday night: get this week's strikes
+  python run_pipeline.py --mode macro       # Fetch US/global macro data
+  python run_pipeline.py --mode monitor     # Check model drift & coverage decay
   python run_pipeline.py --mode retrain     # Retrain models on latest data
 
 Run once in setup mode, then use live mode every Sunday.
@@ -24,9 +27,11 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from loguru import logger
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
+load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -169,6 +174,57 @@ def mode_live():
         print(f"\n  Strikes saved → outputs/strikes_live.json\n")
 
 
+def mode_walkforward():
+    """
+    Expanding-window walk-forward backtest with periodic retraining.
+    Most realistic validation of live performance.
+    """
+    print("\n" + "═"*60)
+    print("  WALK-FORWARD MODE  —  Expanding window + periodic retrain")
+    print("═"*60 + "\n")
+
+    if not _data_exists():
+        print("[ERROR] Data not found. Run --mode setup first.\n")
+        sys.exit(1)
+
+    _step("M7b — Running expanding-window walk-forward backtest")
+    from module7b_walkforward import run_walkforward_backtest
+    summary = run_walkforward_backtest()
+
+    print("\n" + "═"*60)
+    print("  WALK-FORWARD RESULTS")
+    print(f"  Win rate         : {summary.get('win_rate_pct', 0):.1f}%")
+    print(f"  Total P&L        : ₹{summary.get('total_pnl_inr', 0):,.0f}")
+    print(f"  Sharpe ratio     : {summary.get('sharpe_ratio', 0):.2f}")
+    print(f"  Max drawdown     : {summary.get('max_drawdown_points', 0):.0f} pts")
+    print(f"  Expectancy/trade : {summary.get('expectancy_per_trade_points', 0):.1f} pts")
+    print(f"\n  Equity curve  → outputs/walkforward_equity_curve.png")
+    print(f"  Full results  → outputs/walkforward_results.csv")
+    print("═"*60 + "\n")
+
+
+def mode_macro():
+    """Fetch US/global macro data (US VIX, SPX, crude, USD/INR, US 10Y)."""
+    print("\n" + "═"*60)
+    print("  MACRO MODE  —  Fetching global macro data")
+    print("═"*60 + "\n")
+
+    from module1b_macro import fetch_macro_daily
+    fetch_macro_daily()
+    print("\nMacro data saved to data/macro_daily.parquet")
+    print("Re-run --mode setup or --mode retrain to merge macro features.\n")
+
+
+def mode_monitor():
+    """Check model drift, coverage decay, and feature shift."""
+    print("\n" + "═"*60)
+    print("  MONITOR MODE  —  Model health check")
+    print("═"*60 + "\n")
+
+    from module13_monitor import run_monitor
+    run_monitor()
+
+
 def mode_retrain():
     """
     Incremental retrain: fetch new data + rebuild features + GARCH + retrain models.
@@ -192,15 +248,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python run_pipeline.py --mode setup      # First run: fetch data + train
-  python run_pipeline.py --mode backtest   # Check historical performance
-  python run_pipeline.py --mode live       # Sunday night: get this week's strikes
-  python run_pipeline.py --mode retrain    # Retrain on latest data (monthly)
+  python run_pipeline.py --mode setup       # First run: fetch data + train
+  python run_pipeline.py --mode backtest    # Static 80/20 backtest
+  python run_pipeline.py --mode walkforward # True walk-forward (periodic retrain)
+  python run_pipeline.py --mode live        # Sunday night: get this week's strikes
+  python run_pipeline.py --mode macro       # Fetch US/global macro data
+  python run_pipeline.py --mode monitor     # Check model drift & coverage decay
+  python run_pipeline.py --mode retrain     # Retrain on latest data (monthly)
         """
     )
     parser.add_argument(
         "--mode",
-        choices=["setup", "backtest", "live", "retrain"],
+        choices=["setup", "backtest", "walkforward", "live", "macro", "monitor", "retrain"],
         default="live",
         help="Pipeline mode to run (default: live)"
     )
@@ -211,8 +270,14 @@ Examples:
             mode_setup()
         elif args.mode == "backtest":
             mode_backtest()
+        elif args.mode == "walkforward":
+            mode_walkforward()
         elif args.mode == "live":
             mode_live()
+        elif args.mode == "macro":
+            mode_macro()
+        elif args.mode == "monitor":
+            mode_monitor()
         elif args.mode == "retrain":
             mode_retrain()
     except SystemExit:

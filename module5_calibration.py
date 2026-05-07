@@ -213,6 +213,13 @@ def run_calibration() -> dict:
 
         mapie_per_regime[regime] = mapie_r
 
+    # Clear stale per-regime MAPIE files before saving new ones
+    for regime in REGIMES:
+        stale_path = MODELS_DIR / f"mapie_{regime}.pkl"
+        if stale_path.exists():
+            stale_path.unlink()
+            logger.info(f"Removed stale {stale_path}")
+
     # Save per-regime MAPIE models
     for regime, mapie_r in mapie_per_regime.items():
         if mapie_r is not None:

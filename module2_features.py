@@ -257,7 +257,29 @@ def build_features() -> pd.DataFrame:
     vix_zscore.name = "vix_zscore"
 
     # ------------------------------------------------------------------
-    # 12. Event week indicator
+    # 12. Close position within weekly range (where did week close?)
+    # ------------------------------------------------------------------
+    logger.info("Computing close position within range...")
+    close_position = (weekly["close"] - weekly["low"]) / (weekly["high"] - weekly["low"])
+    close_position = close_position.replace([np.inf, -np.inf], np.nan).shift(1)
+    close_position.name = "close_position_in_range"
+
+    # ------------------------------------------------------------------
+    # 13. Trend strength proxy (|close-open| / true range, averaged weekly)
+    # ------------------------------------------------------------------
+    logger.info("Computing trend strength proxy...")
+    daily["tr_tmp"] = pd.concat([
+        daily["high"] - daily["low"],
+        (daily["high"] - daily["close"].shift(1)).abs(),
+        (daily["low"] - daily["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    daily["co_range"] = (daily["close"] - daily["open"]).abs()
+    daily["trend_str"] = daily["co_range"] / daily["tr_tmp"]
+    trend_str_weekly = daily["trend_str"].resample("W-FRI").mean().shift(1)
+    trend_str_weekly.name = "trend_strength_proxy"
+
+    # ------------------------------------------------------------------
+    # 14. Event week indicator
     # ------------------------------------------------------------------
     all_fridays = weekly.index
     logger.info("Computing event-week flag...")
@@ -269,14 +291,14 @@ def build_features() -> pd.DataFrame:
     )
 
     # ------------------------------------------------------------------
-    # 13. Target variable: log range
+    # 15. Target variable: log range
     # ------------------------------------------------------------------
     logger.info("Computing target variable log_range...")
     log_range = np.log(weekly["high"] / weekly["low"])
     log_range.name = "log_range"
 
     # ------------------------------------------------------------------
-    # 14. Merge all features
+    # 16. Merge all features
     # ------------------------------------------------------------------
     logger.info("Merging all features...")
     # LAGGING: Most features must be shifted by 1 to represent state at START of week
@@ -291,12 +313,33 @@ def build_features() -> pd.DataFrame:
         return_4w.shift(1),
         vol_skew.shift(1),
         vix_zscore.shift(1),
+        close_position,
+        trend_str_weekly,
         is_event.shift(1),
         log_range,
     ]
 
     df = pd.concat(frames, axis=1)
     df.index.name = "week_end"
+
+    # ------------------------------------------------------------------
+    # 17. Merge macro features (if available)
+    # ------------------------------------------------------------------
+    macro_path = BASE_DIR / "data" / "macro_daily.parquet"
+    if macro_path.exists():
+        logger.info("Merging macro features...")
+        try:
+            from module1b_macro import build_macro_features
+            macro_feat = build_macro_features()
+            df = df.join(macro_feat, how="left")
+            # Forward-fill macro gaps (e.g., US holidays vs Indian trading)
+            macro_cols = [c for c in macro_feat.columns if c in df.columns]
+            df[macro_cols] = df[macro_cols].ffill(limit=2)
+            logger.info(f"Macro features merged: {macro_cols}")
+        except Exception as e:
+            logger.warning(f"Macro feature merge failed: {e}")
+    else:
+        logger.info("Macro data not found; skipping. Run module1b_macro.py to fetch.")
 
     # Keep only rows where weekly data exists
     df = df[df.index.isin(weekly.index)]
@@ -307,7 +350,7 @@ def build_features() -> pd.DataFrame:
     logger.info(f"Dropped {before - after} rows with NaN (warm-up period). Remaining: {after}")
 
     # ------------------------------------------------------------------
-    # 15. Save
+    # 18. Save
     # ------------------------------------------------------------------
     logger.info(f"Saving feature matrix to {FEATURE_MATRIX_PATH}")
     df.to_parquet(FEATURE_MATRIX_PATH)
