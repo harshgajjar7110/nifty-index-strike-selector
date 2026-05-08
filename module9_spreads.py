@@ -22,7 +22,7 @@ from loguru import logger
 from dotenv import load_dotenv
 
 from utils_constants import REGIMES
-from module6_strikes import round_to_strike, _load_config, predict_range
+from module6_strikes import round_to_strike, predict_range
 from module10_nse_costs import apply_slippage
 
 # ---------------------------------------------------------------------------
@@ -354,24 +354,9 @@ def generate_credit_spread(
             logger.debug(f"PCR={pcr:.2f} → put_skew={put_skew_pts}, call_skew={call_skew_pts}")
 
     # Step 1: DTE Scaling Factor
-    # sqrt(DTE/5): wider buffer/wing for longer-dated spreads (more time to breach)
     dte_scalar = np.sqrt(max(dte_days, 1) / 5.0)
 
-    # Step 2: Half-ranges in points
-    # For credit spreads, use P50 (median) instead of P90 + buffer
-    # This places short strike at the edge of predicted range, not far OTM
-    half_range_p90 = spot * (np.exp(log_range_p90) - 1) / 2
-    half_range_mu  = spot * (np.exp(log_range_mu) - 1) / 2 if log_range_mu else half_range_p90 * 0.6
-
-    # Step 3: Load Base Config
-    buffer_pts, wing_config, vix_baseline, _, min_buffer_pts, _ = _load_config()
-
-    # Step 4: Spread-specific buffer (tighter than IC — no VIX scaling)
-    spread_buffer = float(os.getenv("SPREAD_BUFFER_POINTS", "50"))
-    scaled_buffer = spread_buffer * dte_scalar
-    scaled_buffer = max(scaled_buffer, 25)
-
-    # Step 5: DTE/VIX-Scaled Wing Width (spread-specific, tighter than IC)
+    # Step 2: Wing Width (tighter than IC — spread-specific)
     spread_wing_low  = int(os.getenv("SPREAD_WING_WIDTH_LOW_VIX",  "100"))
     spread_wing_mid  = int(os.getenv("SPREAD_WING_WIDTH_MID_VIX",  "150"))
     spread_wing_high = int(os.getenv("SPREAD_WING_WIDTH_HIGH_VIX", "200"))
@@ -386,14 +371,18 @@ def generate_credit_spread(
     scaled_wing = round_to_strike(scaled_wing, interval=50)
     scaled_wing = max(scaled_wing, 50)
 
-    # Step 6: Strike Placement — use P50 (half_range_mu) for short strike
-    # Bull put: sell put just below predicted support (P50 edge)
-    # Bear call: sell call just above predicted resistance (P50 edge)
+    # Step 3: Strike Placement — 25-delta for meaningful premium collection
+    # K = S * exp(±z * σ√T)  where z≈0.674 for ~25-delta in lognormal
+    sigma = atm_iv if (atm_iv and atm_iv > 0.05) else (garch_vol if garch_vol else vix_level / 100.0)
+    T = dte_days / 365.0
+    sigma_dte = sigma * np.sqrt(T)
+    z_target = float(os.getenv("SPREAD_DELTA_TARGET", "0.674"))
+
     if direction == 'bull_put':
-        short_strike = round_to_strike(spot - half_range_mu - scaled_buffer - put_skew_pts)
+        short_strike = round_to_strike(spot * np.exp(-z_target * sigma_dte) - put_skew_pts)
         long_strike = short_strike - scaled_wing
     else:
-        short_strike = round_to_strike(spot + half_range_mu + scaled_buffer + call_skew_pts)
+        short_strike = round_to_strike(spot * np.exp(z_target * sigma_dte) + call_skew_pts)
         long_strike = short_strike + scaled_wing
 
     # Step 7: Probability of Profit (POP)
@@ -453,7 +442,6 @@ def generate_credit_spread(
         "short_strike":      short_strike,
         "long_strike":       long_strike,
         "wing_width":        int(scaled_wing),
-        "scaled_buffer":     round(scaled_buffer, 2),
         "premium_pts":       metrics["premium_pts"],
         "max_loss_pts":      metrics["max_loss_pts"],
         "max_profit_inr":    round(metrics["premium_pts"]  * NIFTY_LOT_SIZE, 2),
