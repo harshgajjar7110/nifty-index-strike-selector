@@ -358,37 +358,42 @@ def generate_credit_spread(
     dte_scalar = np.sqrt(max(dte_days, 1) / 5.0)
 
     # Step 2: Half-ranges in points
+    # For credit spreads, use P50 (median) instead of P90 + buffer
+    # This places short strike at the edge of predicted range, not far OTM
     half_range_p90 = spot * (np.exp(log_range_p90) - 1) / 2
+    half_range_mu  = spot * (np.exp(log_range_mu) - 1) / 2 if log_range_mu else half_range_p90 * 0.6
 
     # Step 3: Load Base Config
     buffer_pts, wing_config, vix_baseline, _, min_buffer_pts, _ = _load_config()
-    vol_skew_factor = float(os.getenv("VOL_SKEW_FACTOR", "0.03"))
 
-    # Step 4: VIX-Scaled and DTE-Scaled Buffer
-    vix_scalar = vix_level / vix_baseline
-    base_buffer = np.clip(buffer_pts * vix_scalar, min_buffer_pts, 150)
-    scaled_buffer = np.clip(base_buffer * dte_scalar, min_buffer_pts, 300)
+    # Step 4: Spread-specific buffer (tighter than IC — no VIX scaling)
+    spread_buffer = float(os.getenv("SPREAD_BUFFER_POINTS", "50"))
+    scaled_buffer = spread_buffer * dte_scalar
+    scaled_buffer = max(scaled_buffer, 25)
 
-    # Step 5: DTE/VIX-Scaled Wing Width
+    # Step 5: DTE/VIX-Scaled Wing Width (spread-specific, tighter than IC)
+    spread_wing_low  = int(os.getenv("SPREAD_WING_WIDTH_LOW_VIX",  "100"))
+    spread_wing_mid  = int(os.getenv("SPREAD_WING_WIDTH_MID_VIX",  "150"))
+    spread_wing_high = int(os.getenv("SPREAD_WING_WIDTH_HIGH_VIX", "200"))
     if vix_level < 13:
-        base_wing = wing_config['low']
+        base_wing = spread_wing_low
     elif vix_level < 20:
-        base_wing = wing_config['mid']
+        base_wing = spread_wing_mid
     else:
-        base_wing = wing_config['high']
-    
+        base_wing = spread_wing_high
+
     scaled_wing = base_wing * dte_scalar
     scaled_wing = round_to_strike(scaled_wing, interval=50)
-    scaled_wing = max(scaled_wing, 100)
+    scaled_wing = max(scaled_wing, 50)
 
-    # Step 6: Strike Placement
+    # Step 6: Strike Placement — use P50 (half_range_mu) for short strike
+    # Bull put: sell put just below predicted support (P50 edge)
+    # Bear call: sell call just above predicted resistance (P50 edge)
     if direction == 'bull_put':
-        # Apply put skew: negative = tighten (move closer to spot)
-        short_strike = round_to_strike(spot - half_range_p90 - scaled_buffer - put_skew_pts)
+        short_strike = round_to_strike(spot - half_range_mu - scaled_buffer - put_skew_pts)
         long_strike = short_strike - scaled_wing
     else:
-        # Apply call skew: negative = tighten
-        short_strike = round_to_strike(spot + half_range_p90 + scaled_buffer + call_skew_pts)
+        short_strike = round_to_strike(spot + half_range_mu + scaled_buffer + call_skew_pts)
         long_strike = short_strike + scaled_wing
 
     # Step 7: Probability of Profit (POP)
@@ -619,8 +624,8 @@ def generate_all_spreads(
     if dropped > 0:
         logger.info(f"Hard filter: dropped {dropped} spreads (RR < {min_rr} or premium < {min_premium} pts)")
 
-    # Step 5.7: OI liquidity filter (if available; optional)
-    if oi_strikes and min_oi > 0:
+    # Step 5.7: OI liquidity filter (skip if OI data is sparse)
+    if oi_strikes and min_oi > 0 and len(oi_strikes) >= 200:
         def _liquid(strike: float) -> bool:
             k = int(round(strike / 50) * 50)
             row = oi_strikes.get(k, {})
@@ -630,6 +635,8 @@ def generate_all_spreads(
         all_spreads = [s for s in all_spreads
                        if _liquid(s["short_strike"]) and _liquid(s["long_strike"])]
         logger.info(f"OI liquidity filter: {before} → {len(all_spreads)} spreads (min_oi={min_oi})")
+    elif oi_strikes and len(oi_strikes) < 200:
+        logger.warning(f"OI data sparse ({len(oi_strikes)} strikes) — skipping OI liquidity filter")
 
     # Step 5.8: Cap to top N spreads (default 6)
     max_spreads_output = int(os.getenv("MAX_SPREADS_OUTPUT", "6"))
