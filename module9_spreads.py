@@ -19,9 +19,9 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from loguru import logger
-from dotenv import load_dotenv
 
-from utils_constants import REGIMES
+from config import cfg
+from utils_constants import REGIMES, load_regime_thresholds
 from module6_strikes import round_to_strike, predict_range
 from module10_nse_costs import apply_slippage
 
@@ -102,8 +102,8 @@ def _get_strike_iv(
 
     return atm_iv_fallback
 
-NSE_EXPIRY_WEEKDAY = 1  # NSE Nifty 50 options expire on Tuesday (changed from Thursday ~2023)
-NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
+NSE_EXPIRY_WEEKDAY = 1  # NSE Nifty 50 weekly options expire on Tuesday
+NIFTY_LOT_SIZE = cfg.nifty_lot_size
 
 def _last_expiry_weekday_of_month(year: int, month: int) -> date:
     """Find the last NSE_EXPIRY_WEEKDAY of a given month."""
@@ -189,34 +189,13 @@ def get_nse_expiries(today: date, nse_expiry_list: list[str] | None = None) -> l
 
 def estimate_bs_price(
     S: float, K: float, T_years: float, sigma_annual: float,
-    r: float = 0.065, option_type: str = 'put',
-    q: float = 0.015,
+    r: float = cfg.risk_free_rate, option_type: str = 'put',
+    q: float = cfg.dividend_yield,
     vol_skew_factor: float = 0.0,
 ) -> float:
     """Estimate theoretical option price via Black-Scholes with optional vol skew."""
-    if T_years <= 0:
-        T_years = 1.0 / 365.0
-    if sigma_annual <= 0:
-        sigma_annual = 0.10
-    # Apply skew: OTM puts/calls trade at higher IV proportional to OTM distance
-    if vol_skew_factor > 0:
-        if option_type == 'put' and K < S:
-            otm_pct = (S - K) / S
-            sigma_annual = sigma_annual + vol_skew_factor * otm_pct
-        elif option_type == 'call' and K > S:
-            otm_pct = (K - S) / S
-            sigma_annual = sigma_annual + vol_skew_factor * otm_pct
-    # Compute d1, d2
-    d1 = (np.log(S / K) + (r - q + 0.5 * sigma_annual**2) * T_years) / (sigma_annual * np.sqrt(T_years))
-    d2 = d1 - sigma_annual * np.sqrt(T_years)
-    
-    # Black-Scholes pricing
-    if option_type == 'call':
-        price = S * np.exp(-q * T_years) * norm.cdf(d1) - K * np.exp(-r * T_years) * norm.cdf(d2)
-    else:  # put
-        price = K * np.exp(-r * T_years) * norm.cdf(-d2) - S * np.exp(-q * T_years) * norm.cdf(-d1)
-    
-    return max(price, 0.0)
+    from black_scholes import bs_price_with_skew
+    return bs_price_with_skew(S, K, T_years, sigma_annual, option_type, r, q, vol_skew_factor)
 
 def estimate_spread_premium(
     S: float,
@@ -240,7 +219,7 @@ def estimate_spread_premium(
         wing_width  = short_K - long_K
     else:  # bear_call
         # Bear call: sell short_K, buy long_K (long_K > short_K)
-        call_skew_factor = float(os.getenv("CALL_SKEW_FACTOR", "0.01"))
+        call_skew_factor = cfg.call_skew_factor
         short_price = estimate_bs_price(S, short_K, T_years, sigma_annual, r, 'call', q, call_skew_factor)
         long_price  = estimate_bs_price(S, long_K,  T_years, long_sigma,   r, 'call', q, 0.0)
         premium_pts = short_price - long_price
@@ -272,9 +251,7 @@ def detect_direction(feature_row: pd.Series) -> dict:
     Determine bullish/bearish/neutral direction based on feature signals.
     Uses momentum (gap) and VIX trend.
     """
-    # Load config from env
-    load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
-    threshold = float(os.getenv("DIRECTION_CONFIDENCE_THRESHOLD", 0.35))
+    threshold = cfg.direction_confidence_threshold
     
     # Extract signals
     roc = _safe_get(feature_row, "prev_week_gap", 0.0)      # gap up = bullish
@@ -295,9 +272,9 @@ def detect_direction(feature_row: pd.Series) -> dict:
     }
     
     # Composite Score
-    roc_w = float(os.getenv("WEIGHT_ROC", "0.45"))
-    vix_w = float(os.getenv("WEIGHT_VIX", "0.35"))
-    garch_w = float(os.getenv("WEIGHT_GARCH", "0.20"))
+    roc_w = cfg.weight_roc
+    vix_w = cfg.weight_vix
+    garch_w = cfg.weight_garch
     
     weights = {"roc_score": roc_w, "vix_trend_score": vix_w, "garch_acc_score": garch_w}
     composite = sum(signals[k] * w for k, w in weights.items())
@@ -357,12 +334,13 @@ def generate_credit_spread(
     dte_scalar = np.sqrt(max(dte_days, 1) / 5.0)
 
     # Step 2: Wing Width (tighter than IC — spread-specific)
-    spread_wing_low  = int(os.getenv("SPREAD_WING_WIDTH_LOW_VIX",  "100"))
-    spread_wing_mid  = int(os.getenv("SPREAD_WING_WIDTH_MID_VIX",  "150"))
-    spread_wing_high = int(os.getenv("SPREAD_WING_WIDTH_HIGH_VIX", "200"))
-    if vix_level < 13:
+    spread_wing_low  = cfg.spread_wing_width_low_vix
+    spread_wing_mid  = cfg.spread_wing_width_mid_vix
+    spread_wing_high = cfg.spread_wing_width_high_vix
+    low_thresh, high_thresh = load_regime_thresholds()
+    if vix_level < low_thresh:
         base_wing = spread_wing_low
-    elif vix_level < 20:
+    elif vix_level < high_thresh:
         base_wing = spread_wing_mid
     else:
         base_wing = spread_wing_high
@@ -376,7 +354,7 @@ def generate_credit_spread(
     sigma = atm_iv if (atm_iv and atm_iv > 0.05) else (garch_vol if garch_vol else vix_level / 100.0)
     T = dte_days / 365.0
     sigma_dte = sigma * np.sqrt(T)
-    z_target = float(os.getenv("SPREAD_DELTA_TARGET", "0.674"))
+    z_target = cfg.spread_delta_target
 
     if direction == 'bull_put':
         short_strike = round_to_strike(spot * np.exp(-z_target * sigma_dte) - put_skew_pts)
@@ -467,18 +445,17 @@ def generate_all_spreads(
     oi_data: dict | None = None,
 ) -> dict:
     """Orchestrate spread generation for 3 expiries."""
-    load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
     if r is None:
-        r = float(os.getenv("RISK_FREE_RATE", 0.065))
+        r = cfg.risk_free_rate
     if q is None:
-        q = float(os.getenv("DIVIDEND_YIELD", 0.015))
+        q = cfg.dividend_yield
 
     # Extract OI-derived inputs (all optional; None = fall back to GARCH/VIX)
     atm_iv         = oi_data.get("atm_iv")        if oi_data else None
     pcr            = oi_data.get("pcr")            if oi_data else None
     oi_strikes     = {int(k): v for k, v in oi_data.get("strikes", {}).items()} if oi_data else {}
     nse_expiry_list = oi_data.get("expiry_dates")  if oi_data else None
-    min_oi         = int(os.getenv("MIN_OI_LIQUIDITY", "5000"))
+    min_oi         = cfg.min_oi_liquidity
     
     # Step 1: Predict Range
     range_pred = predict_range(feature_row)
@@ -505,7 +482,7 @@ def generate_all_spreads(
     spread_types = ["bull_put", "bear_call"]
     
     # Step 3.5: Filter out low-DTE expiries (gamma risk)
-    min_dte_to_trade = int(os.getenv("MIN_DTE_TO_TRADE", "7"))
+    min_dte_to_trade = cfg.min_dte_to_trade
     expiries_filtered = [e for e in expiries if e["dte"] >= min_dte_to_trade]
 
     # Step 3.6: Augment with calendar fallback if only 1-2 expiries remain (need 3 for 6 spreads)
@@ -574,7 +551,7 @@ def generate_all_spreads(
                 )
                 
                 # Min RR check
-                min_rr = float(os.getenv("MIN_RR_RATIO", 0.15))
+                min_rr = cfg.min_rr_ratio
                 spread["meets_min_rr"] = bool(spread["rr_ratio"] >= min_rr)
                 
                 all_spreads.append(spread)
@@ -585,18 +562,17 @@ def generate_all_spreads(
     all_spreads.sort(key=lambda x: x["ev_proxy"], reverse=True)
 
     # Step 5.5: Hard RR and Premium filters
-    min_rr = float(os.getenv("MIN_RR_RATIO", "0.15"))
+    min_rr = cfg.min_rr_ratio
     
     # Regime-specific premium floor
-    from module6_strikes import _load_regime_thresholds
-    low_thresh, high_thresh = _load_regime_thresholds()
+    low_thresh, high_thresh = load_regime_thresholds()
     
     if vix_level < low_thresh:
-        min_premium = float(os.getenv("MIN_PREMIUM_LOW_VIX_PTS", "15.0"))
+        min_premium = cfg.min_premium_low_vix_pts
     elif vix_level < high_thresh:
-        min_premium = float(os.getenv("MIN_PREMIUM_MID_VIX_PTS", "25.0"))
+        min_premium = cfg.min_premium_mid_vix_pts
     else:
-        min_premium = float(os.getenv("MIN_PREMIUM_HIGH_VIX_PTS", "40.0"))
+        min_premium = cfg.min_premium_high_vix_pts
 
     logger.info(f"VIX={vix_level:.1f} → hard filters: RR >= {min_rr}, premium >= {min_premium} pts")
 
@@ -627,7 +603,7 @@ def generate_all_spreads(
         logger.warning(f"OI data sparse ({len(oi_strikes)} strikes) — skipping OI liquidity filter")
 
     # Step 5.8: Cap to top N spreads (default 6)
-    max_spreads_output = int(os.getenv("MAX_SPREADS_OUTPUT", "6"))
+    max_spreads_output = cfg.max_spreads_output
     if len(all_spreads) > max_spreads_output:
         logger.info(f"Limiting output to top {max_spreads_output} spreads by EV")
         all_spreads = all_spreads[:max_spreads_output]

@@ -28,9 +28,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 from loguru import logger
 from sklearn.base import BaseEstimator, RegressorMixin
+
+from config import cfg
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -46,22 +47,20 @@ sys.path.insert(0, str(BASE_DIR))
 
 from module6_strikes import generate_strikes, round_to_strike
 from module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
-from utils_constants import REGIMES
-
-load_dotenv(BASE_DIR / ".env")
+from utils_constants import REGIMES, load_regime_thresholds
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-INITIAL_TRAIN_WEEKS = int(os.getenv("WF_INITIAL_TRAIN_WEEKS", "120"))   # ~2.3 years
-RETRAIN_EVERY_WEEKS = int(os.getenv("WF_RETRAIN_EVERY_WEEKS", "4"))
-CALIBRATION_WEEKS = int(os.getenv("WF_CALIBRATION_WEEKS", "20"))
-LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
-SL_MULTIPLIER = float(os.getenv("WF_SL_MULTIPLIER", "3.0"))
-SLIPPAGE_ENTRY = float(os.getenv("WF_SLIPPAGE_ENTRY", "1.0"))
-SLIPPAGE_EXIT = float(os.getenv("WF_SLIPPAGE_EXIT", "0.5"))
-WF_MIN_PREMIUM_PTS = float(os.getenv("WF_MIN_PREMIUM_PTS", "20.0"))
-WF_MAX_VIX_TRADE = float(os.getenv("WF_MAX_VIX_TRADE", "30.0"))
+INITIAL_TRAIN_WEEKS = cfg.wf_initial_train_weeks   # ~2.3 years
+RETRAIN_EVERY_WEEKS = cfg.wf_retrain_every_weeks
+CALIBRATION_WEEKS = cfg.wf_calibration_weeks
+LOT_SIZE = cfg.nifty_lot_size
+SL_MULTIPLIER = cfg.wf_sl_multiplier
+SLIPPAGE_ENTRY = cfg.wf_slippage_entry
+SLIPPAGE_EXIT = cfg.wf_slippage_exit
+WF_MIN_PREMIUM_PTS = cfg.wf_min_premium_pts
+WF_MAX_VIX_TRADE = cfg.wf_max_vix_trade
 
 # ---------------------------------------------------------------------------
 # GARCH refit
@@ -76,13 +75,13 @@ def _fit_garch(daily_df: pd.DataFrame) -> pd.Series:
         logger.warning("Too few daily returns for GARCH; using rolling std fallback")
         # Fallback: 20-day rolling std annualized → weekly
         roll_std = returns.rolling(20, min_periods=10).std() / 100
-        weekly_vol = roll_std.resample("W-FRI").mean().shift(1).rename("garch_sigma_mean")
+        weekly_vol = roll_std.resample("W-TUE").mean().shift(1).rename("garch_sigma_mean")
         return weekly_vol
 
     model = arch_model(returns, vol="Garch", p=1, o=1, q=1, dist="skewt")
     result = model.fit(disp="off")
     cond_vol = result.conditional_volatility / 100
-    weekly_mean = cond_vol.resample("W-FRI").mean().rename("garch_sigma_mean").shift(1)
+    weekly_mean = cond_vol.resample("W-TUE").mean().rename("garch_sigma_mean").shift(1)
     return weekly_mean
 
 
@@ -106,22 +105,32 @@ class _RegimeLGBWrapper(BaseEstimator, RegressorMixin):
         return self
 
     def predict(self, X):
-        preds = np.zeros(len(X))
-        for i, row in enumerate(X):
-            vix = row[self.vix_col_idx]
-            regime = "low" if vix < self.low_thresh else ("mid" if vix < self.high_thresh else "high")
+        X_arr = np.asarray(X)
+        preds = np.zeros(len(X_arr))
+        vix_vals = X_arr[:, self.vix_col_idx]
+        regimes = np.where(
+            vix_vals < self.low_thresh, "low",
+            np.where(vix_vals < self.high_thresh, "mid", "high")
+        )
+
+        for regime in ["low", "mid", "high"]:
+            mask = regimes == regime
+            if not mask.any():
+                continue
+            X_regime = X_arr[mask]
             if regime in self.lgb_models:
                 m = self.lgb_models[regime]
-                p10 = float(m["p10"].predict(row.reshape(1, -1))[0])
-                p90 = float(m["p90"].predict(row.reshape(1, -1))[0])
-                preds[i] = (p10 + p90) / 2.0
+                p10 = m["p10"].predict(X_regime)
+                p90 = m["p90"].predict(X_regime)
+                preds[mask] = (p10 + p90) / 2.0
             else:
-                # global median fallback
-                preds[i] = np.median([
-                    (float(m["p10"].predict(row.reshape(1, -1))[0]) +
-                     float(m["p90"].predict(row.reshape(1, -1))[0])) / 2.0
-                    for m in self.lgb_models.values()
-                ])
+                # global median fallback — vectorized across all fallback rows
+                fallback_preds = []
+                for m in self.lgb_models.values():
+                    p10 = m["p10"].predict(X_regime)
+                    p90 = m["p90"].predict(X_regime)
+                    fallback_preds.append((p10 + p90) / 2.0)
+                preds[mask] = np.median(fallback_preds, axis=0)
         return preds
 
 
@@ -141,9 +150,9 @@ def _train_regime_models(
     lgb_models = {}
 
     regime_alphas = {
-        "low": (float(os.getenv("ALPHA_LOW_P10", "0.10")), float(os.getenv("ALPHA_LOW_P90", "0.90"))),
-        "mid": (float(os.getenv("ALPHA_MID_P10", "0.10")), float(os.getenv("ALPHA_MID_P90", "0.90"))),
-        "high": (float(os.getenv("ALPHA_HIGH_P10", "0.10")), float(os.getenv("ALPHA_HIGH_P90", "0.90"))),
+        "low": (cfg.alpha_low_p10, cfg.alpha_low_p90),
+        "mid": (cfg.alpha_mid_p10, cfg.alpha_mid_p90),
+        "high": (cfg.alpha_high_p10, cfg.alpha_high_p90),
     }
 
     for regime in REGIMES:
@@ -221,7 +230,7 @@ def _predict_range_mapie(
         log_range_p10 = float(models["p10"].predict(X)[0])
         log_range_p90 = float(models["p90"].predict(X)[0])
     else:
-        log_range_p10, log_range_p90 = 0.015, 0.035
+        log_range_p10, log_range_p90 = cfg.fallback_log_range_p10, cfg.fallback_log_range_p90
 
     log_range_mu = (log_range_p10 + log_range_p90) / 2.0
     from scipy.stats import norm
@@ -279,7 +288,7 @@ def run_walkforward_backtest() -> dict:
     if n_total <= INITIAL_TRAIN_WEEKS + 5:
         raise ValueError(f"Not enough data ({n_total} rows) for initial_train={INITIAL_TRAIN_WEEKS}")
 
-    target_coverage = float(os.getenv("TARGET_COVERAGE", "0.85"))
+    target_coverage = cfg.target_coverage
 
     # Determine thresholds from full-data optimization (or use defaults for stability)
     # In walk-forward we can compute on initial train only to avoid lookahead
@@ -318,10 +327,10 @@ def run_walkforward_backtest() -> dict:
                 daily_sub = daily_df[daily_df.index <= cutoff]
                 garch_weekly = _fit_garch(daily_sub)
                 # Merge fresh GARCH into train_df for consistency
-                # But train_df already has garch from prior pipeline; we overwrite if index matches
-                # For simplicity we trust the precomputed GARCH in df; refitting GARCH every 4 weeks
-                # is expensive and marginal. Skip for speed.
-                pass
+                if garch_weekly is not None and not garch_weekly.empty:
+                    train_df = train_df.copy()
+                    train_df["garch_sigma_mean"] = garch_weekly.reindex(train_df.index).ffill().bfill()
+                    logger.info(f"  GARCH refitted on {len(daily_sub)} daily rows")
 
             # Train models
             current_models, current_features = _train_regime_models(
@@ -519,9 +528,10 @@ def run_walkforward_backtest() -> dict:
     expectancy = float(np.mean(pnl_arr))
 
     # Breach rate by VIX regime
+    low_thresh, high_thresh = load_regime_thresholds()
     regime_stats = {}
     for regime in ("low", "mid", "high"):
-        mask = valid["vix_level"].apply(lambda v: ("low" if v < 15 else ("mid" if v < 20 else "high")) == regime if not np.isnan(v) else False)
+        mask = valid["vix_level"].apply(lambda v: ("low" if v < low_thresh else ("mid" if v < high_thresh else "high")) == regime if not np.isnan(v) else False)
         subset = valid[mask]
         regime_stats[f"breach_rate_{regime}_vix_pct"] = round(float((subset["won"] == False).sum() / len(subset) * 100), 2) if len(subset) > 0 else None
 

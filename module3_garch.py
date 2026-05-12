@@ -47,11 +47,11 @@ def run_garch_pipeline() -> pd.DataFrame:
     # 4. Extract conditional volatility and convert back from percentage
     cond_vol = result.conditional_volatility / 100
 
-    # 5. Aggregate to weekly (W-FRI) and LAG by 1 week
+    # 5. Aggregate to weekly (W-TUE = Tuesday expiry) and LAG by 1 week
     # This ensures that for the row indexed Friday T, we use volatility from week T-1
     # to predict log_range of week T.
-    weekly_mean = cond_vol.resample("W-FRI").mean().rename("garch_sigma_mean").shift(1)
-    weekly_max = cond_vol.resample("W-FRI").max().rename("garch_sigma_max").shift(1)
+    weekly_mean = cond_vol.resample("W-TUE").mean().rename("garch_sigma_mean").shift(1)
+    weekly_max = cond_vol.resample("W-TUE").max().rename("garch_sigma_max").shift(1)
     garch_weekly = pd.concat([weekly_mean, weekly_max], axis=1)
     garch_weekly.index.name = "week_end"
     logger.info(f"Aggregated GARCH vol to {len(garch_weekly)} weekly observations")

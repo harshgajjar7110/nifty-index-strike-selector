@@ -4,13 +4,14 @@ Calculates SEBI, STT, GST, and Stamp Duty for Nifty 50 Options.
 Includes slippage modeling for realistic Net P&L.
 """
 
-import os
 from loguru import logger
+
+from config import cfg
 
 def calculate_nse_charges(
     premium_pts: float,
     num_legs: int = 4,
-    lot_size: int = 65,
+    lot_size: int = cfg.nifty_lot_size,
     is_sell: bool = True,
     brokerage_per_order: float | None = None
 ) -> dict:
@@ -29,7 +30,7 @@ def calculate_nse_charges(
         Whether this is the entry (sell) or exit (buy/expiry).
     """
     if brokerage_per_order is None:
-        brokerage_per_order = float(os.getenv("BROKERAGE_PER_TRADE_INR", "20.0"))
+        brokerage_per_order = cfg.brokerage_per_trade_inr
     
     turnover = premium_pts * lot_size
     
@@ -84,28 +85,12 @@ def estimate_ic_premium(
     short_call: float, long_call: float,
     dte_days: int,
     vix_level: float,
-    r: float = 0.065,
-    q: float = 0.015,       # Nifty dividend yield ~1.5%
+    r: float = cfg.risk_free_rate,
+    q: float = cfg.dividend_yield,
 ) -> float:
     """Black-Scholes IC net credit: sell short legs, buy wing legs."""
-    from scipy.stats import norm
-    import numpy as np
-
-    T = max(dte_days, 1) / 365.0
-    sigma = max(vix_level / 100.0, 0.05)
-
-    def _bs(S, K, opt):
-        d1 = (np.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
-        if opt == 'put':
-            return K*np.exp(-r*T)*norm.cdf(-d2) - S*np.exp(-q*T)*norm.cdf(-d1)
-        return S*np.exp(-q*T)*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
-
-    net = (_bs(spot, short_put,  'put')
-         - _bs(spot, long_put,   'put')
-         + _bs(spot, short_call, 'call')
-         - _bs(spot, long_call,  'call'))
-    return max(net, 0.0)
+    from black_scholes import estimate_ic_premium_bs
+    return estimate_ic_premium_bs(spot, short_put, long_put, short_call, long_call, dte_days, vix_level, r, q)
 
 if __name__ == "__main__":
     # Test for a 4-leg Iron Condor collecting 80 points

@@ -6,24 +6,23 @@ Convert P10/P90 log-range predictions into Nifty 50 iron condor strike levels.
 import json
 import os
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from dotenv import load_dotenv
 from loguru import logger
 from scipy.stats import norm
 
-from utils_constants import REGIMES
+from config import cfg
+from utils_constants import REGIMES, load_regime_thresholds, extract_vix
 
 try:
     from module4b_risk import breach_probability
 except ImportError:
     breach_probability = None
-
-# load_dotenv only needed for strike config (buffer/wing points), not for credentials
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -37,39 +36,9 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _load_regime_thresholds() -> tuple:
-    """Load optimized VIX regime thresholds from models/; fall back to defaults (15, 20)."""
-    thresh_path = Path(__file__).parent / "models" / "regime_thresholds.json"
-    if thresh_path.exists():
-        with open(thresh_path) as f:
-            t = json.load(f)
-        return t["low_thresh"], t["high_thresh"]
-    return 15.0, 20.0
-
-
-_MODEL_CACHE: dict = {}
-
-def _load_models(force_reload: bool = False):
-    """Load per-regime LightGBM models, MAPIE models, and feature columns.
-
-    Parameters
-    ----------
-    force_reload : bool
-        If True, reload models from disk (invalidate cache). Default False.
-    """
-    import time
-
-    # Check cache validity: return if valid and not forced reload
-    if _MODEL_CACHE and not force_reload:
-        cache_time = _MODEL_CACHE.get("_timestamp", 0)
-        # Check if any model files are newer than cache
-        meta_path = MODELS_DIR / "regime_model_meta.json"
-        if meta_path.exists() and meta_path.stat().st_mtime <= cache_time:
-            return _MODEL_CACHE["lgb"], _MODEL_CACHE["cols"], _MODEL_CACHE["mapie"], _MODEL_CACHE["mapie_global"]
-        elif not meta_path.exists():
-            # Metadata missing but cache exists — return cached (graceful fallback)
-            return _MODEL_CACHE["lgb"], _MODEL_CACHE["cols"], _MODEL_CACHE["mapie"], _MODEL_CACHE["mapie_global"]
-
+@lru_cache(maxsize=1)
+def _load_models_cached() -> tuple[dict, list, dict, object]:
+    """Load per-regime LightGBM models, MAPIE models, and feature columns from disk."""
     meta_path = MODELS_DIR / "regime_model_meta.json"
     if not meta_path.exists():
         raise FileNotFoundError("Run module4_model.py first")
@@ -100,59 +69,26 @@ def _load_models(force_reload: bool = False):
         mapie_global = joblib.load(global_path)
 
     logger.info("Regime LightGBM and MAPIE models loaded.")
-    _MODEL_CACHE["lgb"] = lgb_models
-    _MODEL_CACHE["cols"] = feature_columns
-    _MODEL_CACHE["mapie"] = mapie_per_regime
-    _MODEL_CACHE["mapie_global"] = mapie_global
-    _MODEL_CACHE["_timestamp"] = time.time()
     return lgb_models, feature_columns, mapie_per_regime, mapie_global
 
 
-_CONFIG_CACHE: dict = {}
+def _clear_model_cache() -> None:
+    """Invalidate the model cache."""
+    _load_models_cached.cache_clear()
 
-def _load_config(force_reload: bool = False):
-    """Load strike config from .env, including VIX baseline, put skew, call skew, and minimum buffer.
 
-    Returns 6-tuple: (buffer_pts, wing_dict, vix_baseline, put_skew_pts, min_buffer_pts, call_skew_pts)
-    Note: As of Task 5, wing_dict is {"low": 150, "mid": 200, "high": 250}.
-    """
-    if _CONFIG_CACHE and not force_reload:
-        return _CONFIG_CACHE["buffer"], _CONFIG_CACHE["wing"], _CONFIG_CACHE["vix_baseline"], _CONFIG_CACHE["put_skew"], _CONFIG_CACHE["min_buffer"], _CONFIG_CACHE["call_skew"]
+def _load_models(force_reload: bool = False) -> tuple[dict, list, dict, object]:
+    """Load models with optional cache invalidation."""
+    if force_reload:
+        _clear_model_cache()
+    return _load_models_cached()
 
-    env_path = BASE_DIR / ".env"
-    load_dotenv(dotenv_path=env_path)
-    buffer_pts = int(os.getenv("STRIKE_BUFFER_POINTS", 50))
 
-    # Check if new regime-specific vars are set (they should all be set together for consistency)
-    wing_low_env = os.getenv("WING_WIDTH_LOW_VIX")
-    wing_mid_env = os.getenv("WING_WIDTH_MID_VIX")
-    wing_high_env = os.getenv("WING_WIDTH_HIGH_VIX")
-
-    # If any new regime var is set, use them; else check for legacy WING_WIDTH_POINTS
-    if wing_low_env is not None or wing_mid_env is not None or wing_high_env is not None:
-        # New regime-specific config
-        wing_pts_low  = int(wing_low_env or 150)
-        wing_pts_mid  = int(wing_mid_env or 200)
-        wing_pts_high = int(wing_high_env or 250)
-        logger.info("Using dynamic wing width by VIX regime")
-    else:
-        # Legacy single-value config
-        wing_pts_legacy = int(os.getenv("WING_WIDTH_POINTS", 200))
-        wing_pts_low = wing_pts_mid = wing_pts_high = wing_pts_legacy
-        logger.info(f"Using legacy fixed wing width: {wing_pts_legacy} pts (set WING_WIDTH_LOW/MID/HIGH_VIX for dynamic)")
-
-    put_skew_pts = int(os.getenv("PUT_SKEW_POINTS", 0))
-    call_skew_pts = int(os.getenv("CALL_SKEW_POINTS", 0))
-    min_buffer_pts = int(os.getenv("MIN_BUFFER_POINTS", 75))
-
-    # Validate min_buffer_pts is in reasonable range
-    if min_buffer_pts < 0 or min_buffer_pts > 150:
-        logger.warning(f"MIN_BUFFER_POINTS {min_buffer_pts} out of range [0,150]; using 75")
-        min_buffer_pts = 75
-
-    # Try to load VIX_BASELINE from .env, otherwise compute from historical data
+@lru_cache(maxsize=1)
+def _get_vix_baseline() -> float:
+    """Compute VIX baseline from .env or historical data."""
     vix_baseline = None
-    vix_baseline_env = os.getenv("VIX_BASELINE", None)
+    vix_baseline_env = cfg.vix_baseline if hasattr(cfg, "vix_baseline") else None
     if vix_baseline_env:
         try:
             vix_baseline = float(vix_baseline_env)
@@ -161,12 +97,10 @@ def _load_config(force_reload: bool = False):
             logger.warning(f"Invalid VIX_BASELINE in .env: {vix_baseline_env}, will compute from data")
 
     if vix_baseline is None:
-        # Compute 52-week mean from historical VIX data
         vix_path = BASE_DIR / "data" / "india_vix_daily.parquet"
         if vix_path.exists():
             try:
                 vix_df = pd.read_parquet(vix_path)
-                # Try common column names
                 close_col = None
                 for col in ("close", "Close", "CLOSE", "vix", "VIX"):
                     if col in vix_df.columns:
@@ -187,18 +121,11 @@ def _load_config(force_reload: bool = False):
             logger.warning(f"VIX data file not found at {vix_path}, using default 16.0")
             vix_baseline = 16.0
 
-    # Guard against zero or negative VIX baseline (prevents division by zero)
     if vix_baseline <= 0:
         logger.warning("VIX baseline is <= 0; using default 16.0")
         vix_baseline = 16.0
 
-    _CONFIG_CACHE["buffer"] = buffer_pts
-    _CONFIG_CACHE["wing"] = {"low": wing_pts_low, "mid": wing_pts_mid, "high": wing_pts_high}
-    _CONFIG_CACHE["vix_baseline"] = vix_baseline
-    _CONFIG_CACHE["put_skew"] = put_skew_pts
-    _CONFIG_CACHE["min_buffer"] = min_buffer_pts
-    _CONFIG_CACHE["call_skew"] = call_skew_pts
-    return buffer_pts, _CONFIG_CACHE["wing"], vix_baseline, put_skew_pts, min_buffer_pts, call_skew_pts
+    return vix_baseline
 
 
 def round_to_strike(price: float, interval: int = 50) -> int:
@@ -221,7 +148,7 @@ def predict_range(feature_row: pd.Series) -> dict:
 
     X = feature_row[feature_columns].values.reshape(1, -1)
     vix = float(feature_row["vix_level"])
-    low_thresh, high_thresh = _load_regime_thresholds()
+    low_thresh, high_thresh = load_regime_thresholds()
     regime = "low" if vix < low_thresh else ("mid" if vix < high_thresh else "high")
 
     # Determine which MAPIE model to use
@@ -249,10 +176,10 @@ def predict_range(feature_row: pd.Series) -> dict:
         log_range_sigma = (log_range_p90 - log_range_p10) / (2 * norm.ppf(0.90))
     else:
         logger.warning(f"No model for regime {regime}, using fallback percentiles")
-        log_range_p10 = 0.015
-        log_range_p90 = 0.035
-        log_range_mu = 0.025
-        log_range_sigma = 0.008
+        log_range_p10 = cfg.fallback_log_range_p10
+        log_range_p90 = cfg.fallback_log_range_p90
+        log_range_mu = cfg.fallback_log_range_mu
+        log_range_sigma = cfg.fallback_log_range_sigma
 
     logger.info(f"Predicted log_range: p10={log_range_p10:.4f}, p90={log_range_p90:.4f}, mu={log_range_mu:.4f}, sigma={log_range_sigma:.4f}, regime={regime}")
     return {
@@ -270,10 +197,10 @@ def compute_pcr_skew(pcr: float | None) -> tuple[int, int]:
     """
     if pcr is None:
         return 0, 0
-    pcr_bear = float(os.getenv("PCR_BEAR_THRESHOLD", "0.80"))
-    pcr_bull = float(os.getenv("PCR_BULL_THRESHOLD", "1.20"))
-    put_tighten = int(os.getenv("PCR_PUT_TIGHTEN_PTS", "30"))
-    call_tighten = int(os.getenv("PCR_CALL_TIGHTEN_PTS", "30"))
+    pcr_bear = cfg.pcr_bear_threshold
+    pcr_bull = cfg.pcr_bull_threshold
+    put_tighten = cfg.pcr_put_tighten_pts
+    call_tighten = cfg.pcr_call_tighten_pts
 
     if pcr < pcr_bear:
         # Bearish market: put heavy buying -> tighten puts (negative = closer to spot)
@@ -308,7 +235,18 @@ def generate_strikes(
         put_skew_pts, call_skew_pts = compute_pcr_skew(pcr)
         logger.debug(f"PCR={pcr:.2f} -> put_skew={put_skew_pts}, call_skew={call_skew_pts}")
 
-    buffer_pts, wing_width_config, vix_baseline, loaded_put_skew, min_buffer_pts, loaded_call_skew = _load_config()
+    buffer_pts = cfg.strike_buffer_points
+    wing_width_config = cfg.wing_width_by_regime
+    vix_baseline = _get_vix_baseline()
+    loaded_put_skew = cfg.put_skew_points
+    min_buffer_pts = cfg.min_buffer_points
+    loaded_call_skew = cfg.call_skew_points
+
+    # Validate min_buffer_pts is in reasonable range
+    if min_buffer_pts < 0 or min_buffer_pts > 150:
+        logger.warning(f"MIN_BUFFER_POINTS {min_buffer_pts} out of range [0,150]; using 75")
+        min_buffer_pts = 75
+
     # Use parameter if explicitly provided and non-zero, else use loaded config
     if put_skew_pts == 0:
         put_skew_pts = loaded_put_skew
@@ -326,9 +264,10 @@ def generate_strikes(
             vix_level = vix_baseline
 
     # Select wing width based on VIX regime
-    if vix_level < 15:
+    low_thresh, high_thresh = load_regime_thresholds()
+    if vix_level < low_thresh:
         wing_width = wing_width_config["low"]
-    elif vix_level < 20:
+    elif vix_level < high_thresh:
         wing_width = wing_width_config["mid"]
     else:
         wing_width = wing_width_config["high"]
@@ -397,7 +336,7 @@ def generate_strikes(
         prob_of_profit = float(1 - breach_prob_call - breach_prob_put)
         logger.info(
             f"POP: {prob_of_profit:.1%}, breach_call: {breach_prob_call:.1%}, "
-            f"breach_put: {breach_prob_put:.1%}  [src=ngboost_dist]"
+            f"breach_put: {breach_prob_put:.1%}  [src=dist_model]"
         )
     else:
         # Fallback: lognormal model using GARCH/ATM IV
@@ -477,15 +416,7 @@ def run_live_prediction(feature_row: pd.Series) -> dict:
     spot = fetch_live_spot()
 
     # Extract VIX from feature_row if available
-    vix_level = None
-    for col in ("vix_level", "vix", "india_vix", "VIX", "INDIA_VIX"):
-        if col in feature_row.index:
-            try:
-                vix_level = float(feature_row[col])
-                if vix_level > 0:
-                    break
-            except (ValueError, TypeError):
-                pass
+    vix_level = extract_vix(feature_row)
 
     strikes = generate_strikes(
         current_close=spot,

@@ -46,19 +46,53 @@ def _compute_atr(daily: pd.DataFrame, n: int) -> pd.Series:
 
 def _resample_weekly_last(series: pd.Series) -> pd.Series:
     """Resample a daily series to weekly (Friday), taking the last value."""
-    return series.resample("W-FRI").last()
+    return series.resample("W-TUE").last()
 
 
-def _is_event_week(friday: pd.Timestamp) -> int:
-    """Budget/RBI/earnings week indicator."""
-    month = friday.month
-    week_of_month = (friday.day - 1) // 7 + 1
-    rbi_months = {4, 6, 8, 10, 12}
-    earnings_months = {1, 4, 7, 10}
-    is_budget = (month == 2 and week_of_month == 1)
-    is_rbi = (month in rbi_months and week_of_month == 1)
-    is_earnings = (month in earnings_months and week_of_month == 2)
-    return int(is_budget or is_rbi or is_earnings)
+def _load_event_calendar() -> list[dict]:
+    """Load event calendar from JSON; fallback to hardcoded defaults."""
+    import json
+    cal_path = BASE_DIR / "data" / "event_calendar.json"
+    if cal_path.exists():
+        with open(cal_path) as f:
+            return json.load(f)
+    # Fallback hardcoded (same as before, but now centralized)
+    return [
+        {"name": "Union Budget", "month": 2, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 4, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 6, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 8, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 10, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 12, "week": 1, "start_year": 2020},
+        {"name": "Earnings Season", "month": 1, "week": 2, "start_year": 2020},
+        {"name": "Earnings Season", "month": 4, "week": 2, "start_year": 2020},
+        {"name": "Earnings Season", "month": 7, "week": 2, "start_year": 2020},
+        {"name": "Earnings Season", "month": 10, "week": 2, "start_year": 2020},
+    ]
+
+
+# Module-level cache (events rarely change during a single run)
+_EVENT_CALENDAR = None
+
+
+def _is_event_week(week_end: pd.Timestamp) -> int:
+    """Budget/RBI/earnings week indicator (year-aware)."""
+    global _EVENT_CALENDAR
+    if _EVENT_CALENDAR is None:
+        _EVENT_CALENDAR = _load_event_calendar()
+
+    month = week_end.month
+    week_of_month = (week_end.day - 1) // 7 + 1
+    year = week_end.year
+
+    for event in _EVENT_CALENDAR:
+        if (
+            event["month"] == month
+            and event["week"] == week_of_month
+            and year >= event.get("start_year", 2000)
+        ):
+            return 1
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +117,7 @@ def build_features() -> pd.DataFrame:
     daily = pd.read_parquet(NIFTY_DAILY_PATH)
     daily.index = pd.to_datetime(daily.index)
     daily = daily.sort_index()
+    daily = daily.copy()
 
     # Load intraday data — prefer 1h (2 years), fall back to legacy 5min file
     if NIFTY_1H_PATH.exists():
@@ -95,6 +130,7 @@ def build_features() -> pd.DataFrame:
         raise FileNotFoundError("Run module1_data_pipeline.py first")
     min5.index = pd.to_datetime(min5.index)
     min5 = min5.sort_index()
+    min5 = min5.copy()
 
     logger.info("Loading India VIX data...")
     vix = pd.read_parquet(INDIA_VIX_PATH)
@@ -109,10 +145,11 @@ def build_features() -> pd.DataFrame:
     weekly = pd.read_parquet(NIFTY_WEEKLY_PATH)
     weekly.index = pd.to_datetime(weekly.index)
     weekly = weekly.sort_index()
+    weekly = weekly.copy()
     # Ensure index is Friday-anchored (resample if needed)
     if not (weekly.index.dayofweek == 4).all():
-        logger.warning("Weekly data index not all Fridays — resampling daily to W-FRI")
-        weekly = daily.resample("W-FRI").agg(
+        logger.warning("Weekly data index not all Tuesdays — resampling daily to W-TUE")
+        weekly = daily.resample("W-TUE").agg(
             open=("open", "first"),
             high=("high", "max"),
             low=("low", "min"),
@@ -140,7 +177,7 @@ def build_features() -> pd.DataFrame:
     # Parkinson: sqrt( 1/(4*ln2) * mean(ln(H/L)^2) ) per week
     park_weekly = (
         (daily["log_hl"] ** 2)
-        .resample("W-FRI")
+        .resample("W-TUE")
         .mean()
         .pipe(lambda s: np.sqrt(s / (4 * ln2)))
     )
@@ -150,7 +187,7 @@ def build_features() -> pd.DataFrame:
     gk_term = 0.5 * (daily["log_hl"] ** 2) - (2 * ln2 - 1) * (daily["log_co"] ** 2)
     gk_weekly = (
         gk_term
-        .resample("W-FRI")
+        .resample("W-TUE")
         .mean()
         .pipe(lambda s: np.sqrt(s.clip(lower=0)))
     )
@@ -170,7 +207,7 @@ def build_features() -> pd.DataFrame:
     # Compute realized vol per week from non-NaN returns
     rv_5min = (
         (min5["log_ret"].dropna() ** 2)
-        .resample("W-FRI")
+        .resample("W-TUE")
         .sum()
         .pipe(np.sqrt)
     )
@@ -180,7 +217,7 @@ def build_features() -> pd.DataFrame:
     # 5. VIX features
     # ------------------------------------------------------------------
     logger.info("Computing VIX features...")
-    vix_weekly = vix["close"].resample("W-FRI").last()
+    vix_weekly = vix["close"].resample("W-TUE").last()
     vix_weekly.name = "vix_level"
     vix_change = vix_weekly.diff(1)
     vix_change.name = "vix_change_1w"
@@ -192,13 +229,13 @@ def build_features() -> pd.DataFrame:
     # (already weekly) as the realized vol proxy.
     # ------------------------------------------------------------------
     logger.info("Computing vol risk premium...")
-    # Build a realized vol series: use 5-min RV where available, else Parkinson
-    rv_combined = rv_5min.reindex(park_weekly.index)
-    rv_combined = rv_combined.fillna(park_weekly)  # park_weekly covers full history
-    rv_combined.name = "realized_vol_5min"         # keep column name consistent
-    rv_5min = rv_combined                          # replace sparse series with filled one
+    # Build a hybrid realized vol series: use 5-min RV where available,
+    # else fall back to Parkinson volatility for weeks >2 years ago.
+    rv_hybrid = rv_5min.reindex(park_weekly.index)
+    rv_hybrid = rv_hybrid.fillna(park_weekly)  # park_weekly covers full history
+    rv_hybrid.name = "realized_vol_5min"         # keep column name consistent for backward compat
 
-    rv_ann = rv_5min * np.sqrt(252)
+    rv_ann = rv_hybrid * np.sqrt(252)
     vix_aligned, rv_aligned = vix_weekly.align(rv_ann, join="left")
     vrp = vix_aligned / 100 - rv_aligned
     vrp.name = "vol_risk_premium"
@@ -275,7 +312,7 @@ def build_features() -> pd.DataFrame:
     ], axis=1).max(axis=1)
     daily["co_range"] = (daily["close"] - daily["open"]).abs()
     daily["trend_str"] = daily["co_range"] / daily["tr_tmp"]
-    trend_str_weekly = daily["trend_str"].resample("W-FRI").mean().shift(1)
+    trend_str_weekly = daily["trend_str"].resample("W-TUE").mean().shift(1)
     trend_str_weekly.name = "trend_strength_proxy"
 
     # ------------------------------------------------------------------
@@ -305,13 +342,13 @@ def build_features() -> pd.DataFrame:
     frames = [
         atr5.shift(1), atr14.shift(1), atr21.shift(1),
         park_weekly.shift(1), gk_weekly.shift(1),
-        rv_5min.shift(1),
+        rv_hybrid.shift(1),
         vix_weekly.shift(1), vix_change.shift(1), vrp.shift(1),
-        range_1w.shift(1), range_4w_avg.shift(1),
-        prev_week_gap.shift(1),
+        range_1w, range_4w_avg,
+        prev_week_gap,
         bb_width.shift(1),
-        return_4w.shift(1),
-        vol_skew.shift(1),
+        return_4w,
+        vol_skew,
         vix_zscore.shift(1),
         close_position,
         trend_str_weekly,

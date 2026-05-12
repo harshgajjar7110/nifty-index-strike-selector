@@ -9,16 +9,16 @@ Outputs: outputs/monitor_report_YYYY-MM-DD.json
 """
 
 import json
-import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 from loguru import logger
 from scipy import stats
+
+from config import cfg
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -29,15 +29,13 @@ FEATURE_PATH = DATA_DIR / "feature_matrix_with_garch.parquet"
 BACKTEST_PATH = OUTPUTS_DIR / "walkforward_results.csv"
 CALIBRATION_PATH = OUTPUTS_DIR / "calibration_report.json"
 
-load_dotenv(BASE_DIR / ".env")
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-TARGET_COVERAGE = float(os.getenv("TARGET_COVERAGE", "0.85"))
-COVERAGE_DECAY_THRESHOLD = float(os.getenv("MONITOR_COVERAGE_DECAY", "0.05"))  # 5pp drop
-DRIFT_WINDOW_WEEKS = int(os.getenv("MONITOR_DRIFT_WINDOW_WEEKS", "12"))
-FEATURE_DRIFT_PVAL = float(os.getenv("MONITOR_FEATURE_DRIFT_PVAL", "0.01"))
+TARGET_COVERAGE = cfg.target_coverage
+COVERAGE_DECAY_THRESHOLD = cfg.monitor_coverage_decay  # 5pp drop
+DRIFT_WINDOW_WEEKS = cfg.monitor_drift_window_weeks
+FEATURE_DRIFT_PVAL = cfg.monitor_feature_drift_pval
 
 
 # ---------------------------------------------------------------------------

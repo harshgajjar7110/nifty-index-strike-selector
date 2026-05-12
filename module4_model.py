@@ -6,7 +6,6 @@ Regimes: low (<15), mid (15–20), high (≥20).
 
 from pathlib import Path
 import json
-import os
 import numpy as np
 import pandas as pd
 import joblib
@@ -17,20 +16,17 @@ import shap
 import lightgbm as lgb
 from loguru import logger
 from sklearn.model_selection import TimeSeriesSplit
-from dotenv import load_dotenv
 
+from config import cfg
 from utils_constants import REGIMES, DEFAULT_REGIME_LOW_THRESH, DEFAULT_REGIME_HIGH_THRESH
 
 BASE_DIR = Path(__file__).parent
-load_dotenv(dotenv_path=BASE_DIR / ".env")
 DATA_PATH = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
 MODELS_DIR = BASE_DIR / "models"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 
 REGIME_THRESHOLDS = (DEFAULT_REGIME_LOW_THRESH, DEFAULT_REGIME_HIGH_THRESH)
 MIN_DATA_PER_REGIME = 10
-NGBOOST_N_ESTIMATORS = 250
-NGBOOST_LEARNING_RATE = 0.05
 
 
 def _tune_lgb_regime(X_regime: np.ndarray, y_regime: np.ndarray, alpha: float = 0.90) -> dict:
@@ -119,18 +115,9 @@ def train_models() -> dict:
 
     # Load per-regime quantile alphas from env (configurable)
     regime_alphas = {
-        "low": (
-            float(os.getenv("ALPHA_LOW_P10", "0.10")),
-            float(os.getenv("ALPHA_LOW_P90", "0.90"))
-        ),
-        "mid": (
-            float(os.getenv("ALPHA_MID_P10", "0.15")),
-            float(os.getenv("ALPHA_MID_P90", "0.85"))
-        ),
-        "high": (
-            float(os.getenv("ALPHA_HIGH_P10", "0.10")),
-            float(os.getenv("ALPHA_HIGH_P90", "0.90"))
-        ),
+        "low": (cfg.alpha_low_p10, cfg.alpha_low_p90),
+        "mid": (cfg.alpha_mid_p10, cfg.alpha_mid_p90),
+        "high": (cfg.alpha_high_p10, cfg.alpha_high_p90),
     }
     logger.info(f"Regime alphas: {regime_alphas}")
 
@@ -237,10 +224,14 @@ def train_models() -> dict:
             y_pred_p10[mask] = models["p10"].predict(X_regime_test)
             y_pred_p90[mask] = models["p90"].predict(X_regime_test)
 
-    # Inversion guard
+    # Inversion guard — quantile crossing is a model degeneracy signal
     inverted = y_pred_p90 < y_pred_p10
     if inverted.sum() > 0:
-        logger.warning(f"{inverted.sum()} rows have P90 < P10 — clamping")
+        logger.critical(
+            f"QUANTILE CROSSING: {inverted.sum()} rows have P90 < P10 — "
+            f"model may be mis-specified or data distribution has shifted. "
+            f"Clamping for safety, but investigate immediately."
+        )
         y_pred_p10 = np.minimum(y_pred_p10, y_pred_p90)
 
     # Evaluate overall coverage

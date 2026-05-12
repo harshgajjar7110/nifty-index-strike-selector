@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Tuple
 
+import pandas as pd
+
 BASE_DIR = Path(__file__).parent
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,3 +75,29 @@ def weekly_from_daily(daily_vol: float) -> float:
     """Convert daily volatility to weekly."""
     import numpy as np
     return daily_vol * np.sqrt(TRADING_DAYS_PER_WEEK)
+
+
+def extract_vix(feature_row: pd.Series, default: float | None = None) -> float | None:
+    """Extract VIX level from a feature row using known column aliases.
+
+    Parameters
+    ----------
+    feature_row : pd.Series
+        A pandas Series (e.g. a feature matrix row) that may contain VIX data.
+    default : float | None, optional
+        Value to return if no valid VIX column is found (default: None).
+
+    Returns
+    -------
+    float | None
+        The first valid positive VIX level found, or *default* if none found.
+    """
+    for col in ("vix_level", "vix", "india_vix", "VIX", "INDIA_VIX"):
+        if col in feature_row.index:
+            try:
+                val = float(feature_row[col])
+                if val > 0:
+                    return val
+            except (ValueError, TypeError):
+                pass
+    return default

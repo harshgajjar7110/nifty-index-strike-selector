@@ -13,7 +13,6 @@ statsmodels>=0.14.0
 
 # ML Models
 lightgbm>=4.3.0
-ngboost>=0.4.0
 scikit-learn>=1.4.0
 shap>=0.44.0
 

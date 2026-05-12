@@ -227,15 +227,66 @@ def mode_monitor():
 
 def mode_retrain():
     """
-    Incremental retrain: fetch new data + rebuild features + GARCH + retrain models.
-    Use periodically (monthly) to keep models fresh.
+    Retrain models on existing features without modifying backtest set boundaries.
+    Skips data fetch (M1) and feature engineering (M2) if they already exist.
+    Re-fits GARCH, retrains LightGBM, and recalibrates MAPIE.
     """
     print("\n" + "═"*60)
-    print("  RETRAIN MODE  —  Incremental update + retrain")
+    print("  RETRAIN MODE  —  Model retrain on existing features")
     print("═"*60 + "\n")
 
-    # Same as setup but data fetch is incremental (M1 handles this automatically)
-    mode_setup()
+    # Only fetch data if it doesn't exist (incremental)
+    if not _data_exists():
+        _step("M1 — Incremental data fetch")
+        from module1_data_pipeline import fetch_nifty_daily, fetch_nifty_intraday, fetch_india_vix, build_nifty_weekly
+        daily = fetch_nifty_daily()
+        fetch_nifty_intraday()
+        fetch_india_vix()
+        build_nifty_weekly(daily)
+        logger.success("M1 done — incremental data fetch.")
+    else:
+        logger.info("M1 skipped — data already exists.")
+
+    # Only rebuild features if they don't exist
+    feat_path = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
+    if not feat_path.exists():
+        _step("M2 — Building feature matrix")
+        from module2_features import build_features
+        build_features()
+        logger.success("M2 done — feature matrix built.")
+    else:
+        logger.info("M2 skipped — feature matrix already exists.")
+
+    # M3: Re-fit GARCH
+    _step("M3 — Re-fitting GARCH(1,1)")
+    from module3_garch import run_garch_pipeline
+    garch_df = run_garch_pipeline()
+    logger.success(f"M3 done — {len(garch_df)} rows with GARCH features.")
+
+    # M4: Retrain models
+    _step("M4 — Retraining LightGBM per-regime models")
+    from module4_model import train_models
+    eval_results = train_models()
+    coverage = eval_results.get("coverage_rate", 0)
+    regime_cov = eval_results.get("regime_coverage", {})
+    logger.success(f"M4 done — Coverage: {coverage:.1%} | Per-regime: {regime_cov}")
+
+    # M5: Recalibrate
+    _step("M5 — Recalibrating conformal intervals")
+    from module5_calibration import run_calibration
+    cal_report = run_calibration()
+    target_cov = cal_report.get('target_coverage', 0.85)
+    logger.success(f"M5 done — Coverage @{target_cov:.0%}: {cal_report.get('actual_oos_coverage', '?')}")
+
+    # Invalidate model cache so live mode picks up fresh models
+    _step("Clearing model cache")
+    from module6_strikes import _clear_model_cache
+    _clear_model_cache()
+    logger.success("Model cache cleared — live predictions will use retrained models.")
+
+    print("\n" + "═"*60)
+    print("  RETRAIN COMPLETE")
+    print("═"*60 + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -9,13 +9,14 @@ Usage:
 """
 
 import json
-import os
 import sys
 from datetime import date
 from pathlib import Path
 
 from loguru import logger
-from dotenv import load_dotenv
+
+from config import cfg
+from utils_constants import extract_vix
 
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
@@ -137,15 +138,7 @@ def run_live_pipeline() -> dict:
         logger.info(f"Using feature row for week ending: {feature_row.name}")
 
         # Extract VIX level and GARCH vol from feature row
-        vix_level = None
-        for col in ("vix_level", "vix", "india_vix", "VIX", "INDIA_VIX"):
-            if col in feature_row.index:
-                try:
-                    vix_level = float(feature_row[col])
-                    if vix_level > 0:
-                        break
-                except (ValueError, TypeError):
-                    pass
+        vix_level = extract_vix(feature_row)
 
         garch_vol = None
         if "garch_sigma_mean" in feature_row.index:
@@ -230,7 +223,7 @@ def run_live_pipeline() -> dict:
                     T_years=spread["dte_days"] / 365.0,
                     sigma=spread.get("atm_iv_pct", vix_level) / 100.0 if vix_level else 0.16,
                     spread_type=spread["spread_type"],
-                    lot_size=int(os.getenv("NIFTY_LOT_SIZE", 65)),
+                    lot_size=cfg.nifty_lot_size,
                     capital_config=cap_cfg,
                 )
                 spread["capital_sizing"] = sizing

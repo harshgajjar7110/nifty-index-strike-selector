@@ -5,7 +5,6 @@ Calculates Max Pain, ATM Implied Volatility (IV), and Put-Call Ratio (PCR).
 """
 
 import json
-import os
 from datetime import date, datetime
 from pathlib import Path
 

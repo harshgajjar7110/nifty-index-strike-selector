@@ -5,13 +5,12 @@ Finds the safest (most OTM) short strike that still delivers the target return,
 given a capital budget and risk limit. Supports both weekly and monthly expiries.
 """
 
-import os
 from pathlib import Path
 from math import sqrt, log, exp
-from dotenv import load_dotenv
 from scipy.stats import norm
 import numpy as np
 
+from config import cfg
 from module9_spreads import estimate_spread_premium, NIFTY_LOT_SIZE
 from module6_strikes import round_to_strike
 
@@ -19,22 +18,21 @@ BASE_DIR = Path(__file__).parent
 
 
 def _load_capital_config() -> dict:
-    """Load IC_* config from .env file."""
-    load_dotenv(dotenv_path=BASE_DIR / ".env")
+    """Load IC_* config from centralized config."""
     return {
-        "capital_inr": float(os.getenv("IC_CAPITAL_INR", 500_000)),
-        "capital_at_risk_pct": float(os.getenv("IC_CAPITAL_AT_RISK_PCT", 0.20)),
-        "target_return_monthly": float(os.getenv("IC_TARGET_RETURN_MONTHLY_PCT", 0.025)),
-        "target_return_weekly": float(os.getenv("IC_TARGET_RETURN_WEEKLY_PCT", 0.008)),
-        "expiry_mode": os.getenv("IC_EXPIRY_MODE", "weekly").lower(),
-        "max_extra_buffer_pts": int(os.getenv("IC_MAX_EXTRA_BUFFER_PTS", 500)),
-        "min_pop": float(os.getenv("IC_MIN_POP", 0.75)),
-        "max_breach_prob_per_leg": float(os.getenv("IC_MAX_BREACH_PROB_PER_LEG", 0.15)),
-        "lot_size": int(os.getenv("NIFTY_LOT_SIZE", 65)),
+        "capital_inr": cfg.ic_capital_inr,
+        "capital_at_risk_pct": cfg.ic_capital_at_risk_pct,
+        "target_return_monthly": cfg.ic_target_return_monthly_pct,
+        "target_return_weekly": cfg.ic_target_return_weekly_pct,
+        "expiry_mode": cfg.ic_expiry_mode.lower(),
+        "max_extra_buffer_pts": cfg.ic_max_extra_buffer_pts,
+        "min_pop": cfg.ic_min_pop,
+        "max_breach_prob_per_leg": cfg.ic_max_breach_prob_per_leg,
+        "lot_size": cfg.nifty_lot_size,
     }
 
 
-def compute_margin_per_lot(max_loss_pts: float, lot_size: int = 65) -> float:
+def compute_margin_per_lot(max_loss_pts: float, lot_size: int = cfg.nifty_lot_size) -> float:
     """Margin per lot = max_loss_pts * lot_size (INR)."""
     return max(max_loss_pts, 0.0) * lot_size
 
@@ -54,7 +52,7 @@ def compute_required_premium_pts(
     capital_inr: float,
     target_return_pct: float,
     lots: int,
-    lot_size: int = 65,
+    lot_size: int = cfg.nifty_lot_size,
 ) -> float:
     """Premium per lot (in pts) needed to hit target return."""
     if lots == 0:
@@ -81,10 +79,10 @@ def evaluate_spread_config(
     long_K: float,
     T_years: float,
     sigma: float,
-    lot_size: int = 65,
+    lot_size: int = cfg.nifty_lot_size,
     spread_type: str = "bull_put",
-    r: float = 0.065,
-    q: float = 0.015,
+    r: float = cfg.risk_free_rate,
+    q: float = cfg.dividend_yield,
 ) -> dict:
     """
     Evaluate a spread config using BS pricing.
@@ -121,10 +119,10 @@ def find_safest_viable_spread(
     T_years: float,
     sigma: float,
     spread_type: str = "bull_put",
-    lot_size: int = 65,
+    lot_size: int = cfg.nifty_lot_size,
     capital_config: dict | None = None,
-    r: float = 0.065,
-    q: float = 0.015,
+    r: float = cfg.risk_free_rate,
+    q: float = cfg.dividend_yield,
 ) -> dict:
     """
     Binary search for max extra OTM offset where premium >= required.
@@ -293,7 +291,7 @@ if __name__ == "__main__":
         T_years=T_years,
         sigma=sigma_weekly,
         spread_type="bull_put",
-        lot_size=65,
+        lot_size=cfg.nifty_lot_size,
         capital_config=cfg,
     )
     print(json.dumps(result1, indent=2, default=str))
@@ -306,7 +304,7 @@ if __name__ == "__main__":
         T_years=T_years,
         sigma=sigma_weekly,
         spread_type="bear_call",
-        lot_size=65,
+        lot_size=cfg.nifty_lot_size,
         capital_config=cfg,
     )
     print(json.dumps(result2, indent=2, default=str))
@@ -322,7 +320,7 @@ if __name__ == "__main__":
         T_years=T_years,
         sigma=sigma_weekly,
         spread_type="bull_put",
-        lot_size=65,
+        lot_size=cfg.nifty_lot_size,
         capital_config=tight_cfg,
     )
     print(json.dumps(result3, indent=2, default=str))

@@ -5,16 +5,15 @@ to provide guaranteed coverage bounds on predicted weekly range.
 """
 
 import json
-import os
 import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from loguru import logger
-from dotenv import load_dotenv
 from sklearn.base import BaseEstimator, RegressorMixin
 
+from config import cfg
 from utils_constants import REGIMES
 
 BASE_DIR = Path(__file__).parent
@@ -49,28 +48,39 @@ class RegimeLGBQuantileWrapper(BaseEstimator, RegressorMixin):
         return self
 
     def predict(self, X):
-        preds = np.zeros(len(X))
-        for i, row in enumerate(X):
-            vix = row[self.vix_col_idx]
-            regime = (
-                "low" if vix < self.low_thresh
-                else "mid" if vix < self.high_thresh
-                else "high"
-            )
-            if regime not in self.lgb_models:
-                logger.warning(f"No model for regime '{regime}' — using training median")
-                # Fallback to training median (roughly (P10+P90)/2)
-                preds[i] = np.median([
-                    (float(m["p10"].predict(row.reshape(1, -1))[0]) + 
-                     float(m["p90"].predict(row.reshape(1, -1))[0])) / 2.0
-                    for m in self.lgb_models.values()
-                ])
-            else:
+        X = np.asarray(X)
+        n_samples = X.shape[0]
+        preds = np.zeros(n_samples)
+        vix = X[:, self.vix_col_idx]
+
+        # Regime boolean masks
+        mask_low = vix < self.low_thresh
+        mask_mid = (vix >= self.low_thresh) & (vix < self.high_thresh)
+        mask_high = vix >= self.high_thresh
+
+        fallback_mask = np.zeros(n_samples, dtype=bool)
+
+        for regime, mask in (("low", mask_low), ("mid", mask_mid), ("high", mask_high)):
+            if not np.any(mask):
+                continue
+            if regime in self.lgb_models:
                 model = self.lgb_models[regime]
-                # Use P50 (median) as point prediction
-                p10 = float(model["p10"].predict(row.reshape(1, -1))[0])
-                p90 = float(model["p90"].predict(row.reshape(1, -1))[0])
-                preds[i] = (p10 + p90) / 2.0
+                X_regime = X[mask]
+                p10 = model["p10"].predict(X_regime)
+                p90 = model["p90"].predict(X_regime)
+                preds[mask] = (p10 + p90) / 2.0
+            else:
+                fallback_mask |= mask
+                logger.warning(f"No model for regime '{regime}' — using training median")
+
+        if np.any(fallback_mask):
+            # Vectorized fallback: median of (p10+p90)/2 across all available regimes
+            all_mid_preds = []
+            for m in self.lgb_models.values():
+                p10 = m["p10"].predict(X[fallback_mask])
+                p90 = m["p90"].predict(X[fallback_mask])
+                all_mid_preds.append((p10 + p90) / 2.0)
+            preds[fallback_mask] = np.median(all_mid_preds, axis=0)
 
         return preds
 
@@ -91,9 +101,8 @@ def _coverage_at_target(mid: np.ndarray, half_width: np.ndarray, y_test: np.ndar
 
 
 def run_calibration() -> dict:
-    load_dotenv(dotenv_path=BASE_DIR / ".env")
-    target_coverage = float(os.getenv("TARGET_COVERAGE", "0.85"))
-    logger.info(f"Loaded TARGET_COVERAGE={target_coverage} from .env")
+    target_coverage = cfg.target_coverage
+    logger.info(f"Loaded TARGET_COVERAGE={target_coverage} from config")
 
     # Load regime models
     meta_path = MODELS_DIR / "regime_model_meta.json"
@@ -131,11 +140,11 @@ def run_calibration() -> dict:
     X = df_clean[available_features].values
     y = df_clean[target_col].values
 
-    split_idx = int(len(X) * 0.80)
+    split_idx = int(len(X) * 0.70)
     X_calib_all = df_clean[available_features].iloc[split_idx:]
     y_calib_all = df_clean[target_col].iloc[split_idx:]
     n = len(X_calib_all)
-    mid = int(n * 0.80)  # Use 80% for conformalization, 20% for evaluation
+    mid = int(n * 0.60)  # Use 60% for conformalization, 40% for evaluation (was 80/20 -> noisy 4%)
     X_conf, y_conf = X_calib_all.iloc[:mid], y_calib_all.iloc[:mid]
     X_eval, y_eval = X_calib_all.iloc[mid:], y_calib_all.iloc[mid:]
 

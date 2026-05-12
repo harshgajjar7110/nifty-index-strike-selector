@@ -77,6 +77,28 @@ class _Config(BaseSettings):
     min_oi_liquidity: int = Field(default=5000, ge=0)
 
     # ------------------------------------------------------------------
+    # Spread generation (was os.getenv)
+    # ------------------------------------------------------------------
+    spread_wing_width_low_vix: int = Field(default=100, ge=50, le=500)
+    spread_wing_width_mid_vix: int = Field(default=150, ge=50, le=500)
+    spread_wing_width_high_vix: int = Field(default=200, ge=50, le=500)
+    spread_delta_target: float = Field(default=0.674, ge=0.1, le=2.0)
+
+    # ------------------------------------------------------------------
+    # Walk-forward (was os.getenv)
+    # ------------------------------------------------------------------
+    wf_min_premium_pts: float = Field(default=20.0, ge=0.0, le=500.0)
+    wf_max_vix_trade: float = Field(default=30.0, ge=10.0, le=100.0)
+
+    # ------------------------------------------------------------------
+    # Fallback / calibrated defaults
+    # ------------------------------------------------------------------
+    fallback_log_range_p10: float = Field(default=0.015, ge=0.001, le=0.5)
+    fallback_log_range_p90: float = Field(default=0.035, ge=0.001, le=0.5)
+    fallback_log_range_mu: float = Field(default=0.025, ge=0.001, le=0.5)
+    fallback_log_range_sigma: float = Field(default=0.008, ge=0.001, le=0.5)
+
+    # ------------------------------------------------------------------
     # Direction / skew
     # ------------------------------------------------------------------
     pcr_bear_threshold: float = Field(default=0.80, ge=0.0, le=2.0)

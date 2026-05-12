@@ -11,6 +11,8 @@ import pandas as pd
 import yfinance as yf
 from loguru import logger
 
+from retry_utils import retry
+
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,6 +49,7 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_index()
 
 
+@retry(max_retries=3, backoff_seconds=2.0, exceptions=(Exception,))
 def fetch_macro_daily() -> pd.DataFrame:
     """Fetch / incrementally update macro daily close prices."""
     logger.info("=== Fetching macro data ===")
@@ -116,7 +119,7 @@ def build_macro_features() -> pd.DataFrame:
     df = df.sort_index()
 
     # Resample to weekly (Friday) — last observation
-    weekly = df.resample("W-FRI").last()
+    weekly = df.resample("W-TUE").last()
 
     # 1. US VIX level (lagged)
     us_vix_level = weekly["us_vix"].rename("us_vix_level")
@@ -131,7 +134,7 @@ def build_macro_features() -> pd.DataFrame:
     spx_daily_ret = spx_daily.pct_change()
     spx_vol_20d = (
         (spx_daily_ret.rolling(20, min_periods=10).std() * (252 ** 0.5))
-        .resample("W-FRI")
+        .resample("W-TUE")
         .last()
         .rename("spx_volatility_20d")
     )

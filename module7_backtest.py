@@ -4,7 +4,6 @@ Simulates iron condor P&L over the historical test set using model predictions.
 """
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -13,10 +12,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 from loguru import logger
 
-from utils_constants import REGIMES
+from config import cfg
+from utils_constants import REGIMES, load_regime_thresholds, extract_vix
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -26,7 +25,7 @@ DATA_PATH = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
 WEEKLY_PATH = BASE_DIR / "data" / "nifty_weekly.parquet"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 
-LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "65"))
+LOT_SIZE = cfg.nifty_lot_size
 SKEW_PTS_PER_PERCENT_IMBALANCE = 25  # empirical: 1% breach diff → 25 pts skew
 
 # ---------------------------------------------------------------------------
@@ -35,23 +34,21 @@ SKEW_PTS_PER_PERCENT_IMBALANCE = 25  # empirical: 1% breach diff → 25 pts skew
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from module6_strikes import predict_range, generate_strikes, _load_config  # noqa: E402
+from module6_strikes import predict_range, generate_strikes, _get_vix_baseline  # noqa: E402
 from module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
 from module4b_risk import cvar  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Load configuration from module6 and environment
 # ---------------------------------------------------------------------------
-env_path = BASE_DIR / ".env"
-load_dotenv(dotenv_path=env_path)
 
 # Load VIX baseline from module6 config (ensures consistency with live trading)
-_, _, VIX_BASELINE, _, _, _ = _load_config()
+VIX_BASELINE = _get_vix_baseline()
 logger.info(f"VIX_BASELINE loaded from module6 config: {VIX_BASELINE:.2f}")
 
-# Load PREMIUM_POINTS_BASE from environment (with fallback)
-PREMIUM_POINTS_BASE = int(os.getenv("PREMIUM_POINTS_BASE", 80))
-logger.info(f"PREMIUM_POINTS_BASE loaded from environment: {PREMIUM_POINTS_BASE}")
+# Load PREMIUM_POINTS_BASE from config
+PREMIUM_POINTS_BASE = cfg.premium_points_base
+logger.info(f"PREMIUM_POINTS_BASE loaded from config: {PREMIUM_POINTS_BASE}")
 
 
 # ---------------------------------------------------------------------------
@@ -66,9 +63,10 @@ def _max_drawdown(cumulative_pnl: np.ndarray) -> float:
 
 
 def _vix_regime(vix: float) -> str:
-    if vix < 15:
+    low_thresh, high_thresh = load_regime_thresholds()
+    if vix < low_thresh:
         return "low"
-    elif vix < 20:
+    elif vix < high_thresh:
         return "mid"
     return "high"
 
@@ -164,16 +162,7 @@ def run_backtest() -> dict:
         regime = range_pred.get("regime", "unknown")
 
         # Generate strikes (with VIX level if available)
-        vix_level: float = np.nan
-        for col in ("vix", "india_vix", "VIX", "INDIA_VIX", "vix_level"):
-            if col in feature_row.index:
-                try:
-                    val = float(feature_row[col])
-                    if val > 0:
-                        vix_level = val
-                        break
-                except (ValueError, TypeError):
-                    pass
+        vix_level = extract_vix(feature_row)
 
         # Extract GARCH volatility
         garch_vol = float(feature_row["garch_sigma_mean"]) if "garch_sigma_mean" in feature_row.index else None
@@ -182,13 +171,13 @@ def run_backtest() -> dict:
             current_close,
             log_range_p10,
             log_range_p90,
-            vix_level=vix_level if not np.isnan(vix_level) else None,
+            vix_level=vix_level,
             garch_vol_weekly=garch_vol,
             log_range_mu=log_range_mu,
             log_range_sigma=log_range_sigma,
         )
 
-        vix_used = vix_level if not np.isnan(vix_level) else VIX_BASELINE
+        vix_used = vix_level if vix_level is not None else VIX_BASELINE
         bs_premium = estimate_ic_premium(
             spot=current_close,
             short_put=strikes["short_put"], long_put=strikes["long_put"],

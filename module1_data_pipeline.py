@@ -6,9 +6,12 @@ Fetch, clean, and store historical OHLCV data using Yahoo Finance.
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from loguru import logger
+
+from retry_utils import retry
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -88,14 +91,26 @@ def _load_csv_if_exists() -> pd.DataFrame | None:
 
     # Parse volume (e.g., "440.52M" → 440520000, "1.36B" → 1360000000)
     def parse_vol(v):
-        if isinstance(v, str):
+        try:
+            if v is None:
+                return np.nan
+            if isinstance(v, (int, float)):
+                return float(v)
+            if not isinstance(v, str):
+                return np.nan
+            v = v.strip()
+            if v in ('-', 'N/A', 'NA', ''):
+                return np.nan
             v = v.upper().replace(',', '')
-            if 'B' in v:
-                return float(v.replace('B', '')) * 1e9
-            elif 'M' in v:
-                return float(v.replace('M', '')) * 1e6
+            if v.endswith('B'):
+                return float(v[:-1]) * 1e9
+            elif v.endswith('M'):
+                return float(v[:-1]) * 1e6
+            elif v.endswith('K'):
+                return float(v[:-1]) * 1e3
             return float(v)
-        return float(v)
+        except (ValueError, TypeError):
+            return np.nan
     df['volume'] = df['Vol.'].apply(parse_vol)
 
     df = df[['date', 'open', 'high', 'low', 'close', 'volume']].sort_values('date')
@@ -105,6 +120,7 @@ def _load_csv_if_exists() -> pd.DataFrame | None:
     return df
 
 
+@retry(max_retries=3, backoff_seconds=2.0, exceptions=(Exception,))
 def fetch_nifty_daily() -> pd.DataFrame:
     """Fetch / incrementally update Nifty 50 daily OHLCV (5 years)."""
     logger.info("=== Fetching Nifty 50 daily OHLCV ===")
@@ -150,6 +166,7 @@ def fetch_nifty_daily() -> pd.DataFrame:
     return combined
 
 
+@retry(max_retries=3, backoff_seconds=2.0, exceptions=(Exception,))
 def fetch_nifty_intraday() -> pd.DataFrame:
     """
     Fetch Nifty 50 intraday OHLCV for realized volatility computation.
@@ -206,6 +223,7 @@ def fetch_nifty_5min() -> pd.DataFrame:
     return fetch_nifty_intraday()
 
 
+@retry(max_retries=3, backoff_seconds=2.0, exceptions=(Exception,))
 def fetch_india_vix() -> pd.DataFrame:
     """Fetch / incrementally update India VIX daily close (5 years)."""
     logger.info("=== Fetching India VIX daily ===")
@@ -244,7 +262,7 @@ def build_nifty_weekly(nifty_daily_df: pd.DataFrame) -> pd.DataFrame:
         logger.warning("Daily Nifty data is empty; skipping weekly aggregation.")
         return pd.DataFrame()
 
-    weekly = nifty_daily_df.resample("W-FRI").agg(
+    weekly = nifty_daily_df.resample("W-TUE").agg(
         open=("open", "first"),
         high=("high", "max"),
         low=("low", "min"),
