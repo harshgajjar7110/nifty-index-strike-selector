@@ -3,12 +3,27 @@ Nifty 50 Iron Condor — Master Pipeline
 ========================================
 Single entry point for all modes:
 
-  python run_pipeline.py --mode setup       # First-time: fetch data + train + calibrate
-  python run_pipeline.py --mode backtest    # Validate historical performance
-  python run_pipeline.py --mode live        # Sunday night: get this week's strikes
-  python run_pipeline.py --mode retrain     # Retrain models on latest data
+  # SETUP & TRAINING (one-time)
+  python run_pipeline.py --mode setup              # Fetch data + train + calibrate
+  python run_pipeline.py --mode regime-train       # Train HMM regime detector (Phase 1)
+  
+  # ANALYSIS & FORECASTING
+  python run_pipeline.py --mode forecast-vol       # Generate vol forecasts (Phase 1)
+  python run_pipeline.py --mode analyze-regime     # Current regime analysis (Phase 1)
+  
+  # STRIKE SELECTION (NEW - Phase 2.5)
+  python run_pipeline.py --mode select-strikes     # Optimal strikes + EV analysis
+  
+  # VALIDATION & EXECUTION
+  python run_pipeline.py --mode backtest           # Walk-forward validation
+  python run_pipeline.py --mode live               # This week's strikes (original)
+  python run_pipeline.py --mode retrain            # Incremental retrain (monthly)
 
-Run once in setup mode, then use live mode every Sunday.
+Typical workflow:
+  1. One-time: python run_pipeline.py --mode setup
+  2. One-time: python run_pipeline.py --mode regime-train
+  3. Weekly:   python run_pipeline.py --mode select-strikes
+  4. Sunday:   python run_pipeline.py --mode live
 """
 
 import argparse
@@ -172,6 +187,203 @@ def mode_retrain():
     mode_setup()
 
 
+def mode_regime_train():
+    """
+    Phase 1: Train/retrain HMM regime detection model on historical features.
+    """
+    print("\n" + "═"*60)
+    print("  REGIME TRAINING MODE  —  HMM Regime Detection")
+    print("═"*60 + "\n")
+
+    _step("M1-M2 — Data & Feature pipeline")
+    from module1_data_pipeline import run_pipeline as data_pipeline
+    from module2_features import build_features
+    
+    data_pipeline()
+    features_df = build_features()
+    logger.success(f"Features ready: {features_df.shape}")
+
+    _step("Phase 1.3 — Training HMM Regime Detector")
+    from engine_regime_detection import train_hmm, save_hmm_model
+    
+    model_dict = train_hmm(
+        features_df,
+        test_size=0.2,
+        n_iter=100,
+        random_state=42,
+    )
+    save_hmm_model(model_dict)
+    
+    print(f"\n  HMM Model trained successfully")
+    print(f"  States: Quiet Bull / Range Bound / High Expansion / Panic")
+    print(f"  Test likelihood: {model_dict['test_likelihood']:.4f}")
+    print("═"*60 + "\n")
+
+
+def mode_forecast_vol():
+    """
+    Phase 1: Generate volatility forecasts (GARCH/EWMA/historical ensemble).
+    """
+    print("\n" + "═"*60)
+    print("  VOLATILITY FORECAST MODE")
+    print("═"*60 + "\n")
+
+    _step("M1 — Fetching latest data")
+    from module1_data_pipeline import fetch_nifty_daily
+    
+    daily = fetch_nifty_daily()
+    logger.success(f"Daily data: {len(daily)} rows")
+
+    _step("Phase 1.4 — Generating Volatility Forecasts")
+    from engine_volatility_forecast import generate_forecast_report, save_forecast_report
+    
+    report = generate_forecast_report(daily, lookback_days=252)
+    save_forecast_report(report)
+    
+    print(f"\n  Current Volatility: {report['current_vol']:.4f} ({report['current_regime']})")
+    print(f"  Weekly Forecast:   {report['forecast_weekly']['ensemble'][0]:.4f} ({report['forecast_weekly']['regime']})")
+    print(f"  Swing Forecast:    {report['forecast_swing']['ensemble'][0]:.4f} ({report['forecast_swing']['regime']})")
+    print(f"  Monthly Forecast:  {report['forecast_monthly']['ensemble'][0]:.4f} ({report['forecast_monthly']['regime']})")
+    print("═"*60 + "\n")
+
+
+def mode_analyze_regime():
+    """
+    Phase 1: Analyze current market regime using trained HMM.
+    """
+    print("\n" + "═"*60)
+    print("  REGIME ANALYSIS MODE")
+    print("═"*60 + "\n")
+
+    _step("Loading latest features")
+    from module2_features import build_features
+    
+    try:
+        features_df = build_features()
+    except Exception as e:
+        logger.error(f"Failed to build features: {e}")
+        sys.exit(1)
+
+    _step("Loading trained HMM model")
+    from engine_regime_detection import load_hmm_model, predict_regime_probabilities
+    
+    try:
+        hmm_model, metadata = load_hmm_model()
+        feature_cols = metadata.get("feature_cols", [])
+    except FileNotFoundError as e:
+        logger.error(f"{e}. Train first using --mode regime-train")
+        sys.exit(1)
+
+    _step("Predicting current regime")
+    probs = predict_regime_probabilities(features_df, hmm_model, feature_cols, lookback=1)
+    
+    print(f"\n  Most Likely Regime: {probs['most_likely_regime']}")
+    print(f"  Allocation Score: {probs['allocation_score']}/100")
+    print(f"  Allocation Factor: {probs['allocation_factor']:.1%}")
+    print(f"  Confidence: {probs['confidence']:.1%}")
+    print(f"\n  Regime Probabilities:")
+    for regime, prob in probs["probabilities"].items():
+        print(f"    {regime:20} : {prob:.1%}")
+    print("═"*60 + "\n")
+
+
+def mode_select_strikes():
+    """
+    Phase 2.5: Select optimal strikes combining regime, vol, probability, and EV analysis.
+    Generates actionable strike recommendations for paper trading.
+    """
+    print("\n" + "═"*60)
+    print("  STRIKE SELECTION MODE  —  Phase 2.5")
+    print("═"*60 + "\n")
+
+    # Fetch latest market data
+    _step("Fetching latest market data")
+    from module1_data_pipeline import fetch_nifty_daily, fetch_india_vix, fetch_live_spot_yf
+    
+    daily = fetch_nifty_daily()
+    spot = fetch_live_spot_yf()
+    logger.success(f"Spot price: {spot:.2f}")
+
+    # Get current regime
+    _step("Loading current market regime")
+    from module2_features import build_features
+    from engine_regime_detection import load_hmm_model, predict_regime_probabilities
+    
+    try:
+        features_df = build_features()
+        hmm_model, metadata = load_hmm_model()
+        feature_cols = metadata.get("feature_cols", [])
+        regime_probs = predict_regime_probabilities(features_df, hmm_model, feature_cols, lookback=1)
+        regime_factor = regime_probs['allocation_factor']
+        logger.info(f"Regime: {regime_probs['most_likely_regime']} | Allocation: {regime_factor:.0%}")
+    except Exception as e:
+        logger.warning(f"Regime analysis failed: {e}. Using default allocation 100%")
+        regime_factor = 1.0
+
+    # Generate volatility forecast
+    _step("Generating volatility forecast")
+    from engine_volatility_forecast import generate_forecast_report
+    
+    vol_report = generate_forecast_report(daily, lookback_days=252)
+    vol_weekly = vol_report['forecast_weekly']['ensemble'][0]
+    iv_rank = vol_report.get('iv_rank', 50.0)
+    logger.info(f"Weekly vol forecast: {vol_weekly:.4f} | IV rank: {iv_rank:.0f}")
+
+    # Select strikes for upcoming expiry (weekly)
+    _step("Selecting optimal strikes")
+    from engine_strike_selection import generate_strike_recommendations, save_strike_recommendations
+    
+    dte = 7  # Weekly expiry
+    recommendations = generate_strike_recommendations(
+        spot=spot,
+        volatility=vol_weekly,
+        dte=dte,
+        regime_allocation_factor=regime_factor,
+        iv_rank=iv_rank,
+    )
+    
+    save_strike_recommendations(recommendations)
+
+    # Display results
+    print(f"\n" + "═"*60)
+    print(f"  STRIKE RECOMMENDATIONS")
+    
+    if recommendations['status'] == 'SUCCESS':
+        print(f"  Status: ✓ Tradeable")
+        print(f"  Horizon: {recommendations['horizon'].upper()}")
+        print(f"  DTE: {recommendations['market']['dte']:.0f} | IV Rank: {recommendations['market']['iv_rank']:.0f}")
+        print(f"  Regime Allocation: {recommendations['market']['regime_allocation']:.0%}")
+        
+        if 'put_recommendations' in recommendations and 'best_strike' in recommendations['put_recommendations']:
+            pe = recommendations['put_recommendations']['best_strike']
+            print(f"\n  📉 SHORT PUT")
+            print(f"     Strike: {pe.get('strike', 'N/A'):.2f}")
+            print(f"     Delta: {pe.get('delta', 'N/A'):.4f} | Score: {pe.get('opportunity_score', 'N/A'):.1f}")
+            print(f"     EV/contract: ₹{pe.get('expected_value', 0) * 100:.0f}")
+        
+        if 'call_recommendations' in recommendations and 'best_strike' in recommendations['call_recommendations']:
+            ce = recommendations['call_recommendations']['best_strike']
+            print(f"\n  📈 SHORT CALL")
+            print(f"     Strike: {ce.get('strike', 'N/A'):.2f}")
+            print(f"     Delta: {ce.get('delta', 'N/A'):.4f} | Score: {ce.get('opportunity_score', 'N/A'):.1f}")
+            print(f"     EV/contract: ₹{ce.get('expected_value', 0) * 100:.0f}")
+        
+        if 'multi_leg_strategies' in recommendations and 'strangle' in recommendations['multi_leg_strategies']:
+            strangle = recommendations['multi_leg_strategies']['strangle']
+            print(f"\n  🎯 RECOMMENDED STRATEGY: SHORT STRANGLE")
+            print(f"     Total EV: ₹{strangle.get('total_expected_value', 0) * 100:.0f}")
+            print(f"     Opportunity Score: {strangle.get('opportunity_score', 0):.1f}")
+            print(f"     Portfolio Greeks (Delta/Gamma/Vega/Theta):")
+            greeks = strangle.get('portfolio_greeks', {})
+            print(f"       Δ {greeks.get('delta', 0):.4f} | Γ {greeks.get('gamma', 0):.6f} | V {greeks.get('vega', 0):.3f} | Θ {greeks.get('theta', 0):.3f}")
+    else:
+        print(f"  Status: ✗ {recommendations['status']}")
+        print(f"  Reason: {recommendations.get('reason', 'N/A')}")
+    
+    print(f"\n  Recommendations saved → data/strikes_recommendation_latest.json")
+    print("═"*60 + "\n")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,15 +394,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python run_pipeline.py --mode setup      # First run: fetch data + train
-  python run_pipeline.py --mode backtest   # Check historical performance
-  python run_pipeline.py --mode live       # Sunday night: get this week's strikes
-  python run_pipeline.py --mode retrain    # Retrain on latest data (monthly)
+  python run_pipeline.py --mode setup           # First run: fetch data + train
+  python run_pipeline.py --mode regime-train    # Train HMM regime detector
+  python run_pipeline.py --mode forecast-vol    # Generate vol forecasts
+  python run_pipeline.py --mode analyze-regime  # Current regime analysis
+  python run_pipeline.py --mode backtest        # Check historical performance
+  python run_pipeline.py --mode live            # Sunday night: get this week's strikes
+  python run_pipeline.py --mode retrain         # Retrain on latest data (monthly)
         """
     )
     parser.add_argument(
         "--mode",
-        choices=["setup", "backtest", "live", "retrain"],
+        choices=["setup", "backtest", "live", "retrain", "regime-train", "forecast-vol", "analyze-regime", "select-strikes"],
         default="live",
         help="Pipeline mode to run (default: live)"
     )
@@ -199,6 +414,14 @@ Examples:
     try:
         if args.mode == "setup":
             mode_setup()
+        elif args.mode == "regime-train":
+            mode_regime_train()
+        elif args.mode == "forecast-vol":
+            mode_forecast_vol()
+        elif args.mode == "analyze-regime":
+            mode_analyze_regime()
+        elif args.mode == "select-strikes":
+            mode_select_strikes()
         elif args.mode == "backtest":
             mode_backtest()
         elif args.mode == "live":

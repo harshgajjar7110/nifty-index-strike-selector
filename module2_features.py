@@ -235,14 +235,41 @@ def build_features() -> pd.DataFrame:
     )
 
     # ------------------------------------------------------------------
-    # 10. Target variable: log range
+    # 10. Regime-specific features (for HMM in engine_regime_detection)
+    # ------------------------------------------------------------------
+    logger.info("Computing regime-specific features...")
+    
+    # Trend strength: Compare current close to N-week ago
+    trend_5w = (daily["close"] - daily["close"].shift(35)) / daily["close"].shift(35)
+    trend_5w_weekly = _resample_weekly_last(trend_5w)
+    trend_5w_weekly.name = "trend_strength_5w"
+    
+    # Volatility of volatility: Standard deviation of daily returns
+    daily_returns = daily["close"].pct_change()
+    volatility_daily = daily_returns.rolling(14).std()
+    vol_of_vol = volatility_daily.rolling(21).std()
+    vol_of_vol_weekly = _resample_weekly_last(vol_of_vol)
+    vol_of_vol_weekly.name = "vol_of_vol"
+    
+    # Correlation proxy: Smoothed price momentum vs volatility
+    momentum_20 = daily_returns.rolling(20).mean()
+    mom_vol_corr = _resample_weekly_last(momentum_20)
+    mom_vol_corr.name = "momentum_strength"
+    
+    # Market regime indicator: Combine VIX change with price momentum
+    vix_momentum = vix["close"].pct_change()
+    vix_momentum_weekly = _resample_weekly_last(vix_momentum)
+    vix_momentum_weekly.name = "vix_momentum"
+
+    # ------------------------------------------------------------------
+    # 11. Target variable: log range
     # ------------------------------------------------------------------
     logger.info("Computing target variable log_range...")
     log_range = np.log(weekly["high"] / weekly["low"])
     log_range.name = "log_range"
 
     # ------------------------------------------------------------------
-    # 11. Merge all features
+    # 12. Merge all features
     # ------------------------------------------------------------------
     logger.info("Merging all features...")
     frames = [
@@ -253,6 +280,8 @@ def build_features() -> pd.DataFrame:
         range_1w, range_4w_avg,
         bb_width,
         dte,
+        # Regime-specific features
+        trend_5w_weekly, vol_of_vol_weekly, mom_vol_corr, vix_momentum_weekly,
         log_range,
     ]
 
@@ -268,7 +297,7 @@ def build_features() -> pd.DataFrame:
     logger.info(f"Dropped {before - after} rows with NaN (warm-up period). Remaining: {after}")
 
     # ------------------------------------------------------------------
-    # 12. Save
+    # 13. Save
     # ------------------------------------------------------------------
     logger.info(f"Saving feature matrix to {FEATURE_MATRIX_PATH}")
     df.to_parquet(FEATURE_MATRIX_PATH)

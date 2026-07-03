@@ -203,6 +203,99 @@ def build_nifty_weekly(nifty_daily_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Breadth Data (Market Strength Indicators)
+# ---------------------------------------------------------------------------
+
+BREADTH_PATH = DATA_DIR / "market_breadth.parquet"
+
+
+def estimate_market_breadth() -> dict:
+    """
+    Estimate market breadth from available data (synthetic, since NSE API not available).
+    
+    For MVP: Use VIX + volatility as proxy for breadth.
+    Future: Integrate with NSE API for real advances/declines count.
+    
+    Returns:
+        dict with breadth metrics (estimated)
+    """
+    logger.info("Estimating market breadth (synthetic, using VIX proxy)")
+    
+    vix_data = fetch_india_vix()
+    daily_data = fetch_nifty_daily()
+    
+    if vix_data.empty or daily_data.empty:
+        logger.warning("Insufficient data for breadth estimation.")
+        return {
+            "advances": None,
+            "declines": None,
+            "advance_decline_ratio": None,
+            "breadth_sentiment": "neutral",
+        }
+    
+    # Use VIX and price momentum as proxy
+    latest_vix = vix_data["close"].iloc[-1]
+    latest_price = daily_data["close"].iloc[-1]
+    price_change = daily_data["close"].pct_change().iloc[-1]
+    
+    # Breadth sentiment (synthetic)
+    if latest_vix < 15 and price_change > 0:
+        breadth_sentiment = "strong_up"
+    elif latest_vix < 15:
+        breadth_sentiment = "mild_up"
+    elif latest_vix > 25 and price_change < 0:
+        breadth_sentiment = "strong_down"
+    elif latest_vix > 25:
+        breadth_sentiment = "mild_down"
+    else:
+        breadth_sentiment = "mixed"
+    
+    return {
+        "vix_proxy": float(latest_vix),
+        "price_momentum": float(price_change),
+        "breadth_sentiment": breadth_sentiment,
+        "note": "Synthetic breadth (real data requires NSE API)",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Multi-Timeframe Aggregation Helpers
+# ---------------------------------------------------------------------------
+
+def aggregate_to_period(
+    ohlcv_df: pd.DataFrame,
+    period: str = "W-FRI",
+    agg_func: str = "ohlcv",
+) -> pd.DataFrame:
+    """
+    Generic aggregation to any period (daily, weekly, monthly, etc).
+    
+    Args:
+        ohlcv_df: DataFrame with OHLCV columns
+        period: Resample period ('D', 'W-FRI', 'M', etc)
+        agg_func: 'ohlcv' = full OHLC aggregation, else 'close_only'
+        
+    Returns:
+        Aggregated DataFrame
+    """
+    if ohlcv_df.empty:
+        return pd.DataFrame()
+    
+    if agg_func == "ohlcv":
+        agg = ohlcv_df.resample(period).agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        })
+    else:
+        agg = ohlcv_df[["close"]].resample(period).last()
+    
+    return agg.dropna()
+
+
+# ---------------------------------------------------------------------------
 # Live spot (no credentials)
 # ---------------------------------------------------------------------------
 
@@ -219,24 +312,28 @@ def fetch_live_spot_yf() -> float:
 # ---------------------------------------------------------------------------
 
 def run_pipeline() -> dict:
+    """Run full data pipeline: fetch all required market data."""
     nifty_daily  = fetch_nifty_daily()
-    nifty_5min   = fetch_nifty_5min()
+    nifty_intraday = fetch_nifty_intraday()
     india_vix    = fetch_india_vix()
     nifty_weekly = build_nifty_weekly(nifty_daily)
+    breadth = estimate_market_breadth()
 
     summary = {
-        "nifty_daily_rows":  len(nifty_daily),
-        "nifty_5min_rows":   len(nifty_5min),
-        "india_vix_rows":    len(india_vix),
-        "nifty_weekly_rows": len(nifty_weekly),
+        "nifty_daily_rows":    len(nifty_daily),
+        "nifty_intraday_rows": len(nifty_intraday),
+        "india_vix_rows":      len(india_vix),
+        "nifty_weekly_rows":   len(nifty_weekly),
+        "breadth_sentiment":   breadth.get("breadth_sentiment", "unknown"),
     }
 
-    print("\n=== Pipeline Summary ===")
-    print(f"  Nifty 50 daily  : {summary['nifty_daily_rows']:>6} rows")
-    print(f"  Nifty 50 5-min  : {summary['nifty_5min_rows']:>6} rows  (last 60 days)")
-    print(f"  India VIX daily : {summary['india_vix_rows']:>6} rows")
-    print(f"  Nifty weekly    : {summary['nifty_weekly_rows']:>6} rows")
-    print("========================\n")
+    print("\n=== Data Pipeline Summary ===")
+    print(f"  Nifty 50 daily     : {summary['nifty_daily_rows']:>6} rows")
+    print(f"  Nifty 50 intraday  : {summary['nifty_intraday_rows']:>6} rows")
+    print(f"  India VIX daily    : {summary['india_vix_rows']:>6} rows")
+    print(f"  Nifty weekly       : {summary['nifty_weekly_rows']:>6} rows")
+    print(f"  Breadth sentiment  : {summary['breadth_sentiment']}")
+    print("===============================\n")
     return summary
 
 
