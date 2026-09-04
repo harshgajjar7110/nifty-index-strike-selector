@@ -3,27 +3,15 @@ Nifty 50 Iron Condor — Master Pipeline
 ========================================
 Single entry point for all modes:
 
-  # SETUP & TRAINING (one-time)
-  python run_pipeline.py --mode setup              # Fetch data + train + calibrate
-  python run_pipeline.py --mode regime-train       # Train HMM regime detector (Phase 1)
-  
-  # ANALYSIS & FORECASTING
-  python run_pipeline.py --mode forecast-vol       # Generate vol forecasts (Phase 1)
-  python run_pipeline.py --mode analyze-regime     # Current regime analysis (Phase 1)
-  
-  # STRIKE SELECTION (NEW - Phase 2.5)
-  python run_pipeline.py --mode select-strikes     # Optimal strikes + EV analysis
-  
-  # VALIDATION & EXECUTION
-  python run_pipeline.py --mode backtest           # Walk-forward validation
-  python run_pipeline.py --mode live               # This week's strikes (original)
-  python run_pipeline.py --mode retrain            # Incremental retrain (monthly)
+  python run_pipeline.py --mode setup       # First-time: fetch data + train + calibrate
+  python run_pipeline.py --mode backtest    # Static 80/20 backtest
+  python run_pipeline.py --mode walkforward # True expanding-window backtest (periodic retrain)
+  python run_pipeline.py --mode live        # Sunday night: get this week's strikes
+  python run_pipeline.py --mode macro       # Fetch US/global macro data
+  python run_pipeline.py --mode monitor     # Check model drift & coverage decay
+  python run_pipeline.py --mode retrain     # Retrain models on latest data
 
-Typical workflow:
-  1. One-time: python run_pipeline.py --mode setup
-  2. One-time: python run_pipeline.py --mode regime-train
-  3. Weekly:   python run_pipeline.py --mode select-strikes
-  4. Sunday:   python run_pipeline.py --mode live
+Run once in setup mode, then use live mode every Sunday.
 """
 
 import argparse
@@ -39,9 +27,11 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from loguru import logger
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
+load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -58,10 +48,18 @@ def _data_exists() -> bool:
 
 
 def _models_exist() -> bool:
-    return (
-        (BASE_DIR / "models" / "lgbm_p10.pkl").exists()
-        and (BASE_DIR / "models" / "lgbm_p90.pkl").exists()
-    )
+    required_files = [
+        "lgb_low.pkl",
+        "lgb_mid.pkl",
+        "lgb_high.pkl",
+        "feature_columns.pkl",
+        "regime_thresholds.json",
+        "regime_model_meta.json",
+        "regime_lgb_wrapper.pkl",
+        "mapie_calibrated.pkl",
+        "garch_model.pkl"
+    ]
+    return all((BASE_DIR / "models" / f).exists() for f in required_files)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,24 +97,25 @@ def mode_setup():
     garch_df = run_garch_pipeline()
     logger.success(f"M3 done — {len(garch_df)} rows with GARCH features.")
 
-    # M4: Train LightGBM quantile models
-    _step("M4 — Training LightGBM P10/P90 quantile models")
+    # M4: Train LightGBM regime models
+    _step("M4 — Training LightGBM per-regime models (low/mid/high VIX)")
     from module4_model import train_models
     eval_results = train_models()
     coverage = eval_results.get("coverage_rate", 0)
-    logger.success(f"M4 done — Coverage: {coverage:.1%} | Pinball P10: {eval_results.get('pinball_p10', '?'):.4f}")
+    regime_cov = eval_results.get("regime_coverage", {})
+    logger.success(f"M4 done — Coverage: {coverage:.1%} | Per-regime: {regime_cov}")
 
     # M5: Conformal calibration
     _step("M5 — Conformal calibration (MAPIE)")
     from module5_calibration import run_calibration
     cal_report = run_calibration()
-    logger.success(f"M5 done — Coverage @85%: {cal_report.get('coverage_at_85', '?')}")
+    target_cov = cal_report.get('target_coverage', 0.85)
+    logger.success(f"M5 done — Coverage @{target_cov:.0%}: {cal_report.get('actual_oos_coverage', '?')}")
 
     print("\n" + "═"*60)
     print("  SETUP COMPLETE")
-    print(f"  Coverage @80%: {cal_report.get('coverage_at_80', '?')}")
-    print(f"  Coverage @85%: {cal_report.get('coverage_at_85', '?')}")
-    print(f"  Coverage @90%: {cal_report.get('coverage_at_90', '?')}")
+    print(f"  Target Coverage : {cal_report.get('target_coverage', '?')}")
+    print(f"  Actual OOS Cov  : {cal_report.get('actual_oos_coverage', '?')}")
     print("  → Run backtest:  python run_pipeline.py --mode backtest")
     print("  → Get strikes:   python run_pipeline.py --mode live")
     print("═"*60 + "\n")
@@ -141,14 +140,15 @@ def mode_backtest():
 
     print("\n" + "═"*60)
     print("  BACKTEST RESULTS")
-    print(f"  Win rate         : {summary.get('win_rate_pct', '?'):.1f}%")
+    print(f"  Win rate         : {summary.get('win_rate_pct', 0):.1f}%")
     print(f"  Total P&L        : ₹{summary.get('total_pnl_inr', 0):,.0f}")
-    print(f"  Sharpe ratio     : {summary.get('sharpe', '?'):.2f}")
-    print(f"  Max drawdown     : {summary.get('max_drawdown_pts', '?')} pts")
-    print(f"  Expectancy/trade : {summary.get('expectancy_pts', '?'):.1f} pts")
-    vix = summary.get("breach_rate_by_vix", {})
-    print(f"  Breach rate (VIX low/mid/high): "
-          f"{vix.get('low', '?'):.0%} / {vix.get('mid', '?'):.0%} / {vix.get('high', '?'):.0%}")
+    print(f"  Sharpe ratio     : {summary.get('sharpe_ratio', 0):.2f}")
+    print(f"  Max drawdown     : {summary.get('max_drawdown_points', 0):.0f} pts")
+    print(f"  Expectancy/trade : {summary.get('expectancy_per_trade_points', 0):.1f} pts")
+    low = summary.get('breach_rate_low_vix_pct', 0)
+    mid = summary.get('breach_rate_mid_vix_pct', 0)
+    high = summary.get('breach_rate_high_vix_pct', 0)
+    print(f"  Breach rate (VIX low/mid/high): {low:.0f}% / {mid:.0f}% / {high:.0f}%")
     print(f"\n  Equity curve  → outputs/backtest_equity_curve.png")
     print(f"  Full results  → outputs/backtest_results.csv")
     print("═"*60 + "\n")
@@ -174,213 +174,118 @@ def mode_live():
         print(f"\n  Strikes saved → outputs/strikes_live.json\n")
 
 
+def mode_walkforward():
+    """
+    Expanding-window walk-forward backtest with periodic retraining.
+    Most realistic validation of live performance.
+    """
+    print("\n" + "═"*60)
+    print("  WALK-FORWARD MODE  —  Expanding window + periodic retrain")
+    print("═"*60 + "\n")
+
+    if not _data_exists():
+        print("[ERROR] Data not found. Run --mode setup first.\n")
+        sys.exit(1)
+
+    _step("M7b — Running expanding-window walk-forward backtest")
+    from module7b_walkforward import run_walkforward_backtest
+    summary = run_walkforward_backtest()
+
+    print("\n" + "═"*60)
+    print("  WALK-FORWARD RESULTS")
+    print(f"  Win rate         : {summary.get('win_rate_pct', 0):.1f}%")
+    print(f"  Total P&L        : ₹{summary.get('total_pnl_inr', 0):,.0f}")
+    print(f"  Sharpe ratio     : {summary.get('sharpe_ratio', 0):.2f}")
+    print(f"  Max drawdown     : {summary.get('max_drawdown_points', 0):.0f} pts")
+    print(f"  Expectancy/trade : {summary.get('expectancy_per_trade_points', 0):.1f} pts")
+    print(f"\n  Equity curve  → outputs/walkforward_equity_curve.png")
+    print(f"  Full results  → outputs/walkforward_results.csv")
+    print("═"*60 + "\n")
+
+
+def mode_macro():
+    """Fetch US/global macro data (US VIX, SPX, crude, USD/INR, US 10Y)."""
+    print("\n" + "═"*60)
+    print("  MACRO MODE  —  Fetching global macro data")
+    print("═"*60 + "\n")
+
+    from module1b_macro import fetch_macro_daily
+    fetch_macro_daily()
+    print("\nMacro data saved to data/macro_daily.parquet")
+    print("Re-run --mode setup or --mode retrain to merge macro features.\n")
+
+
+def mode_monitor():
+    """Check model drift, coverage decay, and feature shift."""
+    print("\n" + "═"*60)
+    print("  MONITOR MODE  —  Model health check")
+    print("═"*60 + "\n")
+
+    from module13_monitor import run_monitor
+    run_monitor()
+
+
 def mode_retrain():
     """
-    Incremental retrain: fetch new data + rebuild features + GARCH + retrain models.
-    Use periodically (monthly) to keep models fresh.
+    Retrain models on existing features without modifying backtest set boundaries.
+    Skips data fetch (M1) and feature engineering (M2) if they already exist.
+    Re-fits GARCH, retrains LightGBM, and recalibrates MAPIE.
     """
     print("\n" + "═"*60)
-    print("  RETRAIN MODE  —  Incremental update + retrain")
+    print("  RETRAIN MODE  —  Model retrain on existing features")
     print("═"*60 + "\n")
 
-    # Same as setup but data fetch is incremental (M1 handles this automatically)
-    mode_setup()
-
-
-def mode_regime_train():
-    """
-    Phase 1: Train/retrain HMM regime detection model on historical features.
-    """
-    print("\n" + "═"*60)
-    print("  REGIME TRAINING MODE  —  HMM Regime Detection")
-    print("═"*60 + "\n")
-
-    _step("M1-M2 — Data & Feature pipeline")
-    from module1_data_pipeline import run_pipeline as data_pipeline
-    from module2_features import build_features
-    
-    data_pipeline()
-    features_df = build_features()
-    logger.success(f"Features ready: {features_df.shape}")
-
-    _step("Phase 1.3 — Training HMM Regime Detector")
-    from engine_regime_detection import train_hmm, save_hmm_model
-    
-    model_dict = train_hmm(
-        features_df,
-        test_size=0.2,
-        n_iter=100,
-        random_state=42,
-    )
-    save_hmm_model(model_dict)
-    
-    print(f"\n  HMM Model trained successfully")
-    print(f"  States: Quiet Bull / Range Bound / High Expansion / Panic")
-    print(f"  Test likelihood: {model_dict['test_likelihood']:.4f}")
-    print("═"*60 + "\n")
-
-
-def mode_forecast_vol():
-    """
-    Phase 1: Generate volatility forecasts (GARCH/EWMA/historical ensemble).
-    """
-    print("\n" + "═"*60)
-    print("  VOLATILITY FORECAST MODE")
-    print("═"*60 + "\n")
-
-    _step("M1 — Fetching latest data")
-    from module1_data_pipeline import fetch_nifty_daily
-    
-    daily = fetch_nifty_daily()
-    logger.success(f"Daily data: {len(daily)} rows")
-
-    _step("Phase 1.4 — Generating Volatility Forecasts")
-    from engine_volatility_forecast import generate_forecast_report, save_forecast_report
-    
-    report = generate_forecast_report(daily, lookback_days=252)
-    save_forecast_report(report)
-    
-    print(f"\n  Current Volatility: {report['current_vol']:.4f} ({report['current_regime']})")
-    print(f"  Weekly Forecast:   {report['forecast_weekly']['ensemble'][0]:.4f} ({report['forecast_weekly']['regime']})")
-    print(f"  Swing Forecast:    {report['forecast_swing']['ensemble'][0]:.4f} ({report['forecast_swing']['regime']})")
-    print(f"  Monthly Forecast:  {report['forecast_monthly']['ensemble'][0]:.4f} ({report['forecast_monthly']['regime']})")
-    print("═"*60 + "\n")
-
-
-def mode_analyze_regime():
-    """
-    Phase 1: Analyze current market regime using trained HMM.
-    """
-    print("\n" + "═"*60)
-    print("  REGIME ANALYSIS MODE")
-    print("═"*60 + "\n")
-
-    _step("Loading latest features")
-    from module2_features import build_features
-    
-    try:
-        features_df = build_features()
-    except Exception as e:
-        logger.error(f"Failed to build features: {e}")
-        sys.exit(1)
-
-    _step("Loading trained HMM model")
-    from engine_regime_detection import load_hmm_model, predict_regime_probabilities
-    
-    try:
-        hmm_model, metadata = load_hmm_model()
-        feature_cols = metadata.get("feature_cols", [])
-    except FileNotFoundError as e:
-        logger.error(f"{e}. Train first using --mode regime-train")
-        sys.exit(1)
-
-    _step("Predicting current regime")
-    probs = predict_regime_probabilities(features_df, hmm_model, feature_cols, lookback=1)
-    
-    print(f"\n  Most Likely Regime: {probs['most_likely_regime']}")
-    print(f"  Allocation Score: {probs['allocation_score']}/100")
-    print(f"  Allocation Factor: {probs['allocation_factor']:.1%}")
-    print(f"  Confidence: {probs['confidence']:.1%}")
-    print(f"\n  Regime Probabilities:")
-    for regime, prob in probs["probabilities"].items():
-        print(f"    {regime:20} : {prob:.1%}")
-    print("═"*60 + "\n")
-
-
-def mode_select_strikes():
-    """
-    Phase 2.5: Select optimal strikes combining regime, vol, probability, and EV analysis.
-    Generates actionable strike recommendations for paper trading.
-    """
-    print("\n" + "═"*60)
-    print("  STRIKE SELECTION MODE  —  Phase 2.5")
-    print("═"*60 + "\n")
-
-    # Fetch latest market data
-    _step("Fetching latest market data")
-    from module1_data_pipeline import fetch_nifty_daily, fetch_india_vix, fetch_live_spot_yf
-    
-    daily = fetch_nifty_daily()
-    spot = fetch_live_spot_yf()
-    logger.success(f"Spot price: {spot:.2f}")
-
-    # Get current regime
-    _step("Loading current market regime")
-    from module2_features import build_features
-    from engine_regime_detection import load_hmm_model, predict_regime_probabilities
-    
-    try:
-        features_df = build_features()
-        hmm_model, metadata = load_hmm_model()
-        feature_cols = metadata.get("feature_cols", [])
-        regime_probs = predict_regime_probabilities(features_df, hmm_model, feature_cols, lookback=1)
-        regime_factor = regime_probs['allocation_factor']
-        logger.info(f"Regime: {regime_probs['most_likely_regime']} | Allocation: {regime_factor:.0%}")
-    except Exception as e:
-        logger.warning(f"Regime analysis failed: {e}. Using default allocation 100%")
-        regime_factor = 1.0
-
-    # Generate volatility forecast
-    _step("Generating volatility forecast")
-    from engine_volatility_forecast import generate_forecast_report
-    
-    vol_report = generate_forecast_report(daily, lookback_days=252)
-    vol_weekly = vol_report['forecast_weekly']['ensemble'][0]
-    iv_rank = vol_report.get('iv_rank', 50.0)
-    logger.info(f"Weekly vol forecast: {vol_weekly:.4f} | IV rank: {iv_rank:.0f}")
-
-    # Select strikes for upcoming expiry (weekly)
-    _step("Selecting optimal strikes")
-    from engine_strike_selection import generate_strike_recommendations, save_strike_recommendations
-    
-    dte = 7  # Weekly expiry
-    recommendations = generate_strike_recommendations(
-        spot=spot,
-        volatility=vol_weekly,
-        dte=dte,
-        regime_allocation_factor=regime_factor,
-        iv_rank=iv_rank,
-    )
-    
-    save_strike_recommendations(recommendations)
-
-    # Display results
-    print(f"\n" + "═"*60)
-    print(f"  STRIKE RECOMMENDATIONS")
-    
-    if recommendations['status'] == 'SUCCESS':
-        print(f"  Status: ✓ Tradeable")
-        print(f"  Horizon: {recommendations['horizon'].upper()}")
-        print(f"  DTE: {recommendations['market']['dte']:.0f} | IV Rank: {recommendations['market']['iv_rank']:.0f}")
-        print(f"  Regime Allocation: {recommendations['market']['regime_allocation']:.0%}")
-        
-        if 'put_recommendations' in recommendations and 'best_strike' in recommendations['put_recommendations']:
-            pe = recommendations['put_recommendations']['best_strike']
-            print(f"\n  📉 SHORT PUT")
-            print(f"     Strike: {pe.get('strike', 'N/A'):.2f}")
-            print(f"     Delta: {pe.get('delta', 'N/A'):.4f} | Score: {pe.get('opportunity_score', 'N/A'):.1f}")
-            print(f"     EV/contract: ₹{pe.get('expected_value', 0) * 100:.0f}")
-        
-        if 'call_recommendations' in recommendations and 'best_strike' in recommendations['call_recommendations']:
-            ce = recommendations['call_recommendations']['best_strike']
-            print(f"\n  📈 SHORT CALL")
-            print(f"     Strike: {ce.get('strike', 'N/A'):.2f}")
-            print(f"     Delta: {ce.get('delta', 'N/A'):.4f} | Score: {ce.get('opportunity_score', 'N/A'):.1f}")
-            print(f"     EV/contract: ₹{ce.get('expected_value', 0) * 100:.0f}")
-        
-        if 'multi_leg_strategies' in recommendations and 'strangle' in recommendations['multi_leg_strategies']:
-            strangle = recommendations['multi_leg_strategies']['strangle']
-            print(f"\n  🎯 RECOMMENDED STRATEGY: SHORT STRANGLE")
-            print(f"     Total EV: ₹{strangle.get('total_expected_value', 0) * 100:.0f}")
-            print(f"     Opportunity Score: {strangle.get('opportunity_score', 0):.1f}")
-            print(f"     Portfolio Greeks (Delta/Gamma/Vega/Theta):")
-            greeks = strangle.get('portfolio_greeks', {})
-            print(f"       Δ {greeks.get('delta', 0):.4f} | Γ {greeks.get('gamma', 0):.6f} | V {greeks.get('vega', 0):.3f} | Θ {greeks.get('theta', 0):.3f}")
+    # Only fetch data if it doesn't exist (incremental)
+    if not _data_exists():
+        _step("M1 — Incremental data fetch")
+        from module1_data_pipeline import fetch_nifty_daily, fetch_nifty_intraday, fetch_india_vix, build_nifty_weekly
+        daily = fetch_nifty_daily()
+        fetch_nifty_intraday()
+        fetch_india_vix()
+        build_nifty_weekly(daily)
+        logger.success("M1 done — incremental data fetch.")
     else:
-        print(f"  Status: ✗ {recommendations['status']}")
-        print(f"  Reason: {recommendations.get('reason', 'N/A')}")
-    
-    print(f"\n  Recommendations saved → data/strikes_recommendation_latest.json")
+        logger.info("M1 skipped — data already exists.")
+
+    # Only rebuild features if they don't exist
+    feat_path = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
+    if not feat_path.exists():
+        _step("M2 — Building feature matrix")
+        from module2_features import build_features
+        build_features()
+        logger.success("M2 done — feature matrix built.")
+    else:
+        logger.info("M2 skipped — feature matrix already exists.")
+
+    # M3: Re-fit GARCH
+    _step("M3 — Re-fitting GARCH(1,1)")
+    from module3_garch import run_garch_pipeline
+    garch_df = run_garch_pipeline()
+    logger.success(f"M3 done — {len(garch_df)} rows with GARCH features.")
+
+    # M4: Retrain models
+    _step("M4 — Retraining LightGBM per-regime models")
+    from module4_model import train_models
+    eval_results = train_models()
+    coverage = eval_results.get("coverage_rate", 0)
+    regime_cov = eval_results.get("regime_coverage", {})
+    logger.success(f"M4 done — Coverage: {coverage:.1%} | Per-regime: {regime_cov}")
+
+    # M5: Recalibrate
+    _step("M5 — Recalibrating conformal intervals")
+    from module5_calibration import run_calibration
+    cal_report = run_calibration()
+    target_cov = cal_report.get('target_coverage', 0.85)
+    logger.success(f"M5 done — Coverage @{target_cov:.0%}: {cal_report.get('actual_oos_coverage', '?')}")
+
+    # Invalidate model cache so live mode picks up fresh models
+    _step("Clearing model cache")
+    from module6_strikes import _clear_model_cache
+    _clear_model_cache()
+    logger.success("Model cache cleared — live predictions will use retrained models.")
+
+    print("\n" + "═"*60)
+    print("  RETRAIN COMPLETE")
     print("═"*60 + "\n")
 
 
@@ -394,18 +299,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python run_pipeline.py --mode setup           # First run: fetch data + train
-  python run_pipeline.py --mode regime-train    # Train HMM regime detector
-  python run_pipeline.py --mode forecast-vol    # Generate vol forecasts
-  python run_pipeline.py --mode analyze-regime  # Current regime analysis
-  python run_pipeline.py --mode backtest        # Check historical performance
-  python run_pipeline.py --mode live            # Sunday night: get this week's strikes
-  python run_pipeline.py --mode retrain         # Retrain on latest data (monthly)
+  python run_pipeline.py --mode setup       # First run: fetch data + train
+  python run_pipeline.py --mode backtest    # Static 80/20 backtest
+  python run_pipeline.py --mode walkforward # True walk-forward (periodic retrain)
+  python run_pipeline.py --mode live        # Sunday night: get this week's strikes
+  python run_pipeline.py --mode macro       # Fetch US/global macro data
+  python run_pipeline.py --mode monitor     # Check model drift & coverage decay
+  python run_pipeline.py --mode retrain     # Retrain on latest data (monthly)
         """
     )
     parser.add_argument(
         "--mode",
-        choices=["setup", "backtest", "live", "retrain", "regime-train", "forecast-vol", "analyze-regime", "select-strikes"],
+        choices=["setup", "backtest", "walkforward", "live", "macro", "monitor", "retrain"],
         default="live",
         help="Pipeline mode to run (default: live)"
     )
@@ -414,18 +319,16 @@ Examples:
     try:
         if args.mode == "setup":
             mode_setup()
-        elif args.mode == "regime-train":
-            mode_regime_train()
-        elif args.mode == "forecast-vol":
-            mode_forecast_vol()
-        elif args.mode == "analyze-regime":
-            mode_analyze_regime()
-        elif args.mode == "select-strikes":
-            mode_select_strikes()
         elif args.mode == "backtest":
             mode_backtest()
+        elif args.mode == "walkforward":
+            mode_walkforward()
         elif args.mode == "live":
             mode_live()
+        elif args.mode == "macro":
+            mode_macro()
+        elif args.mode == "monitor":
+            mode_monitor()
         elif args.mode == "retrain":
             mode_retrain()
     except SystemExit:

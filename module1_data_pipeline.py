@@ -3,13 +3,15 @@ Module 1: Data Pipeline (yfinance — no API key required)
 Fetch, clean, and store historical OHLCV data using Yahoo Finance.
 """
 
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from loguru import logger
+
+from retry_utils import retry
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -64,9 +66,75 @@ def _save(df: pd.DataFrame, path: Path) -> None:
 # Fetch functions
 # ---------------------------------------------------------------------------
 
+def _load_csv_if_exists() -> pd.DataFrame | None:
+    """Load Nifty 50 data from local CSV if it exists."""
+    csv_path = DATA_DIR / "Nifty 50 Historical Data.csv"
+    if not csv_path.exists():
+        logger.warning(f"Historical CSV not found at {csv_path}. Using Yahoo Finance fallback for all history.")
+        return None
+
+    logger.info(f"Loading historical data from {csv_path.name}")
+    df = pd.read_csv(csv_path)
+    df['Date'] = pd.to_datetime(df['Date'], format='%d-%m-%Y')
+    df = df.rename(columns={
+        'Date': 'date',
+        'Open': 'open',
+        'High': 'high',
+        'Low': 'low',
+        'Price': 'close'
+    })
+
+    # Convert prices to float (remove commas from string prices)
+    for col in ['open', 'high', 'low', 'close']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+
+    # Parse volume (e.g., "440.52M" → 440520000, "1.36B" → 1360000000)
+    def parse_vol(v):
+        try:
+            if v is None:
+                return np.nan
+            if isinstance(v, (int, float)):
+                return float(v)
+            if not isinstance(v, str):
+                return np.nan
+            v = v.strip()
+            if v in ('-', 'N/A', 'NA', ''):
+                return np.nan
+            v = v.upper().replace(',', '')
+            if v.endswith('B'):
+                return float(v[:-1]) * 1e9
+            elif v.endswith('M'):
+                return float(v[:-1]) * 1e6
+            elif v.endswith('K'):
+                return float(v[:-1]) * 1e3
+            return float(v)
+        except (ValueError, TypeError):
+            return np.nan
+    df['volume'] = df['Vol.'].apply(parse_vol)
+
+    df = df[['date', 'open', 'high', 'low', 'close', 'volume']].sort_values('date')
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    df.index.name = 'date'
+    return df
+
+
+@retry(max_retries=3, backoff_seconds=2.0, exceptions=(Exception,))
 def fetch_nifty_daily() -> pd.DataFrame:
     """Fetch / incrementally update Nifty 50 daily OHLCV (5 years)."""
     logger.info("=== Fetching Nifty 50 daily OHLCV ===")
+
+    # Try loading from CSV first
+    csv_data = _load_csv_if_exists()
+
+    # If CSV exists and parquet doesn't, use CSV as base and skip Yahoo Finance fetch
+    if csv_data is not None and not NIFTY_DAILY_PATH.exists():
+        logger.info(f"Using CSV data ({len(csv_data)} rows) as base. Skipping Yahoo Finance for this setup.")
+        _save(csv_data, NIFTY_DAILY_PATH)
+        return csv_data
+
+    # Check if parquet is already up to date
     last = _last_date(NIFTY_DAILY_PATH)
     start = (last + timedelta(days=1)) if last else (datetime.today() - timedelta(days=5 * 365))
     today = datetime.today()
@@ -75,6 +143,7 @@ def fetch_nifty_daily() -> pd.DataFrame:
         logger.info("nifty_daily.parquet is already up to date.")
         return pd.read_parquet(NIFTY_DAILY_PATH)
 
+    # Fetch only incremental data from Yahoo Finance
     raw = yf.download(NIFTY_SYMBOL, start=start.strftime("%Y-%m-%d"),
                       end=today.strftime("%Y-%m-%d"), interval="1d",
                       progress=False, auto_adjust=True)
@@ -84,6 +153,8 @@ def fetch_nifty_daily() -> pd.DataFrame:
         logger.warning("No new daily data returned.")
         return pd.read_parquet(NIFTY_DAILY_PATH) if NIFTY_DAILY_PATH.exists() else new_df
 
+    # Load existing data once (avoid TOCTOU race)
+    existing = None
     if NIFTY_DAILY_PATH.exists():
         existing = pd.read_parquet(NIFTY_DAILY_PATH)
         combined = pd.concat([existing, new_df])
@@ -95,6 +166,7 @@ def fetch_nifty_daily() -> pd.DataFrame:
     return combined
 
 
+@retry(max_retries=3, backoff_seconds=2.0, exceptions=(Exception,))
 def fetch_nifty_intraday() -> pd.DataFrame:
     """
     Fetch Nifty 50 intraday OHLCV for realized volatility computation.
@@ -151,6 +223,7 @@ def fetch_nifty_5min() -> pd.DataFrame:
     return fetch_nifty_intraday()
 
 
+@retry(max_retries=3, backoff_seconds=2.0, exceptions=(Exception,))
 def fetch_india_vix() -> pd.DataFrame:
     """Fetch / incrementally update India VIX daily close (5 years)."""
     logger.info("=== Fetching India VIX daily ===")
@@ -189,7 +262,7 @@ def build_nifty_weekly(nifty_daily_df: pd.DataFrame) -> pd.DataFrame:
         logger.warning("Daily Nifty data is empty; skipping weekly aggregation.")
         return pd.DataFrame()
 
-    weekly = nifty_daily_df.resample("W-FRI").agg(
+    weekly = nifty_daily_df.resample("W-TUE").agg(
         open=("open", "first"),
         high=("high", "max"),
         low=("low", "min"),
@@ -200,99 +273,6 @@ def build_nifty_weekly(nifty_daily_df: pd.DataFrame) -> pd.DataFrame:
     weekly = weekly.dropna(subset=["open", "close"])
     _save(weekly, NIFTY_WEEKLY_PATH)
     return weekly
-
-
-# ---------------------------------------------------------------------------
-# Breadth Data (Market Strength Indicators)
-# ---------------------------------------------------------------------------
-
-BREADTH_PATH = DATA_DIR / "market_breadth.parquet"
-
-
-def estimate_market_breadth() -> dict:
-    """
-    Estimate market breadth from available data (synthetic, since NSE API not available).
-    
-    For MVP: Use VIX + volatility as proxy for breadth.
-    Future: Integrate with NSE API for real advances/declines count.
-    
-    Returns:
-        dict with breadth metrics (estimated)
-    """
-    logger.info("Estimating market breadth (synthetic, using VIX proxy)")
-    
-    vix_data = fetch_india_vix()
-    daily_data = fetch_nifty_daily()
-    
-    if vix_data.empty or daily_data.empty:
-        logger.warning("Insufficient data for breadth estimation.")
-        return {
-            "advances": None,
-            "declines": None,
-            "advance_decline_ratio": None,
-            "breadth_sentiment": "neutral",
-        }
-    
-    # Use VIX and price momentum as proxy
-    latest_vix = vix_data["close"].iloc[-1]
-    latest_price = daily_data["close"].iloc[-1]
-    price_change = daily_data["close"].pct_change().iloc[-1]
-    
-    # Breadth sentiment (synthetic)
-    if latest_vix < 15 and price_change > 0:
-        breadth_sentiment = "strong_up"
-    elif latest_vix < 15:
-        breadth_sentiment = "mild_up"
-    elif latest_vix > 25 and price_change < 0:
-        breadth_sentiment = "strong_down"
-    elif latest_vix > 25:
-        breadth_sentiment = "mild_down"
-    else:
-        breadth_sentiment = "mixed"
-    
-    return {
-        "vix_proxy": float(latest_vix),
-        "price_momentum": float(price_change),
-        "breadth_sentiment": breadth_sentiment,
-        "note": "Synthetic breadth (real data requires NSE API)",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Multi-Timeframe Aggregation Helpers
-# ---------------------------------------------------------------------------
-
-def aggregate_to_period(
-    ohlcv_df: pd.DataFrame,
-    period: str = "W-FRI",
-    agg_func: str = "ohlcv",
-) -> pd.DataFrame:
-    """
-    Generic aggregation to any period (daily, weekly, monthly, etc).
-    
-    Args:
-        ohlcv_df: DataFrame with OHLCV columns
-        period: Resample period ('D', 'W-FRI', 'M', etc)
-        agg_func: 'ohlcv' = full OHLC aggregation, else 'close_only'
-        
-    Returns:
-        Aggregated DataFrame
-    """
-    if ohlcv_df.empty:
-        return pd.DataFrame()
-    
-    if agg_func == "ohlcv":
-        agg = ohlcv_df.resample(period).agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        })
-    else:
-        agg = ohlcv_df[["close"]].resample(period).last()
-    
-    return agg.dropna()
 
 
 # ---------------------------------------------------------------------------
@@ -312,28 +292,24 @@ def fetch_live_spot_yf() -> float:
 # ---------------------------------------------------------------------------
 
 def run_pipeline() -> dict:
-    """Run full data pipeline: fetch all required market data."""
     nifty_daily  = fetch_nifty_daily()
-    nifty_intraday = fetch_nifty_intraday()
+    nifty_5min   = fetch_nifty_5min()
     india_vix    = fetch_india_vix()
     nifty_weekly = build_nifty_weekly(nifty_daily)
-    breadth = estimate_market_breadth()
 
     summary = {
-        "nifty_daily_rows":    len(nifty_daily),
-        "nifty_intraday_rows": len(nifty_intraday),
-        "india_vix_rows":      len(india_vix),
-        "nifty_weekly_rows":   len(nifty_weekly),
-        "breadth_sentiment":   breadth.get("breadth_sentiment", "unknown"),
+        "nifty_daily_rows":  len(nifty_daily),
+        "nifty_5min_rows":   len(nifty_5min),
+        "india_vix_rows":    len(india_vix),
+        "nifty_weekly_rows": len(nifty_weekly),
     }
 
-    print("\n=== Data Pipeline Summary ===")
-    print(f"  Nifty 50 daily     : {summary['nifty_daily_rows']:>6} rows")
-    print(f"  Nifty 50 intraday  : {summary['nifty_intraday_rows']:>6} rows")
-    print(f"  India VIX daily    : {summary['india_vix_rows']:>6} rows")
-    print(f"  Nifty weekly       : {summary['nifty_weekly_rows']:>6} rows")
-    print(f"  Breadth sentiment  : {summary['breadth_sentiment']}")
-    print("===============================\n")
+    print("\n=== Pipeline Summary ===")
+    print(f"  Nifty 50 daily  : {summary['nifty_daily_rows']:>6} rows")
+    print(f"  Nifty 50 5-min  : {summary['nifty_5min_rows']:>6} rows  (last 60 days)")
+    print(f"  India VIX daily : {summary['india_vix_rows']:>6} rows")
+    print(f"  Nifty weekly    : {summary['nifty_weekly_rows']:>6} rows")
+    print("========================\n")
     return summary
 
 

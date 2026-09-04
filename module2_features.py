@@ -5,6 +5,7 @@ Weekly Range Predictor (iron condor options trading).
 """
 
 import numpy as np
+import os
 import pandas as pd
 from pathlib import Path
 from loguru import logger
@@ -29,15 +30,6 @@ FEATURE_MATRIX_PATH = DATA_DIR / "feature_matrix.parquet"
 
 
 
-def _days_to_next_expiry(friday: pd.Timestamp) -> float:
-    """Return calendar days from `friday` (week_end) to the next weekly expiry Thursday.
-
-    Nifty options expire every Thursday (weekly). Since week_end is a Friday,
-    the next expiry Thursday is always 6 calendar days away.
-    """
-    return 6.0
-
-
 def _compute_atr(daily: pd.DataFrame, n: int) -> pd.Series:
     """Compute N-day ATR from daily OHLCV DataFrame."""
     high = daily["high"]
@@ -54,8 +46,54 @@ def _compute_atr(daily: pd.DataFrame, n: int) -> pd.Series:
 
 
 def _resample_weekly_last(series: pd.Series) -> pd.Series:
-    """Resample a daily series to weekly (Friday), taking the last value."""
-    return series.resample("W-FRI").last()
+    """Resample a daily series to weekly (Tuesday), taking the last value."""
+    return series.resample("W-TUE").last()
+
+
+def _load_event_calendar() -> list[dict]:
+    """Load event calendar from JSON; fallback to hardcoded defaults."""
+    import json
+    cal_path = BASE_DIR / "data" / "event_calendar.json"
+    if cal_path.exists():
+        with open(cal_path) as f:
+            return json.load(f)
+    # Fallback hardcoded (same as before, but now centralized)
+    return [
+        {"name": "Union Budget", "month": 2, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 4, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 6, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 8, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 10, "week": 1, "start_year": 2020},
+        {"name": "RBI MPC", "month": 12, "week": 1, "start_year": 2020},
+        {"name": "Earnings Season", "month": 1, "week": 2, "start_year": 2020},
+        {"name": "Earnings Season", "month": 4, "week": 2, "start_year": 2020},
+        {"name": "Earnings Season", "month": 7, "week": 2, "start_year": 2020},
+        {"name": "Earnings Season", "month": 10, "week": 2, "start_year": 2020},
+    ]
+
+
+# Module-level cache (events rarely change during a single run)
+_EVENT_CALENDAR = None
+
+
+def _is_event_week(week_end: pd.Timestamp) -> int:
+    """Budget/RBI/earnings week indicator (year-aware)."""
+    global _EVENT_CALENDAR
+    if _EVENT_CALENDAR is None:
+        _EVENT_CALENDAR = _load_event_calendar()
+
+    month = week_end.month
+    week_of_month = (week_end.day - 1) // 7 + 1
+    year = week_end.year
+
+    for event in _EVENT_CALENDAR:
+        if (
+            event["month"] == month
+            and event["week"] == week_of_month
+            and year >= event.get("start_year", 2000)
+        ):
+            return 1
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -66,16 +104,21 @@ def build_features() -> pd.DataFrame:
     # ------------------------------------------------------------------
     # 1. Load inputs
     # ------------------------------------------------------------------
-    for path in [NIFTY_DAILY_PATH, NIFTY_5MIN_PATH, INDIA_VIX_PATH, NIFTY_WEEKLY_PATH]:
+    for path in [NIFTY_DAILY_PATH, INDIA_VIX_PATH, NIFTY_WEEKLY_PATH]:
         if not path.exists():
             raise FileNotFoundError(
                 f"{path} not found. Run module1_data_pipeline.py first"
             )
+    if not NIFTY_1H_PATH.exists() and not NIFTY_5MIN_PATH.exists():
+        raise FileNotFoundError(
+            f"Neither {NIFTY_1H_PATH} nor {NIFTY_5MIN_PATH} found. Run module1_data_pipeline.py first"
+        )
 
     logger.info("Loading daily OHLCV data...")
     daily = pd.read_parquet(NIFTY_DAILY_PATH)
     daily.index = pd.to_datetime(daily.index)
     daily = daily.sort_index()
+    daily = daily.copy()
 
     # Load intraday data — prefer 1h (2 years), fall back to legacy 5min file
     if NIFTY_1H_PATH.exists():
@@ -88,6 +131,7 @@ def build_features() -> pd.DataFrame:
         raise FileNotFoundError("Run module1_data_pipeline.py first")
     min5.index = pd.to_datetime(min5.index)
     min5 = min5.sort_index()
+    min5 = min5.copy()
 
     logger.info("Loading India VIX data...")
     vix = pd.read_parquet(INDIA_VIX_PATH)
@@ -102,16 +146,17 @@ def build_features() -> pd.DataFrame:
     weekly = pd.read_parquet(NIFTY_WEEKLY_PATH)
     weekly.index = pd.to_datetime(weekly.index)
     weekly = weekly.sort_index()
-    # Ensure index is Friday-anchored (resample if needed)
-    if not (weekly.index.dayofweek == 4).all():
-        logger.warning("Weekly data index not all Fridays — resampling daily to W-FRI")
-        weekly = daily.resample("W-FRI").agg(
+    weekly = weekly.copy()
+    # Ensure index is Tuesday-anchored (resample if needed)
+    if not (weekly.index.dayofweek == 1).all():
+        logger.warning("Weekly data index not all Tuesdays — resampling daily to W-TUE")
+        weekly = daily.resample("W-TUE").agg(
             open=("open", "first"),
             high=("high", "max"),
             low=("low", "min"),
             close=("close", "last"),
             volume=("volume", "sum"),
-        )
+        ).dropna(subset=["open", "close"])
 
     # ------------------------------------------------------------------
     # 2. ATR features (daily, resampled to weekly last value)
@@ -133,7 +178,7 @@ def build_features() -> pd.DataFrame:
     # Parkinson: sqrt( 1/(4*ln2) * mean(ln(H/L)^2) ) per week
     park_weekly = (
         (daily["log_hl"] ** 2)
-        .resample("W-FRI")
+        .resample("W-TUE")
         .mean()
         .pipe(lambda s: np.sqrt(s / (4 * ln2)))
     )
@@ -143,7 +188,7 @@ def build_features() -> pd.DataFrame:
     gk_term = 0.5 * (daily["log_hl"] ** 2) - (2 * ln2 - 1) * (daily["log_co"] ** 2)
     gk_weekly = (
         gk_term
-        .resample("W-FRI")
+        .resample("W-TUE")
         .mean()
         .pipe(lambda s: np.sqrt(s.clip(lower=0)))
     )
@@ -153,20 +198,17 @@ def build_features() -> pd.DataFrame:
     # 4. Realized volatility from 5-min data
     # ------------------------------------------------------------------
     logger.info("Computing 5-min realized volatility...")
-    # Compute log returns within each trading date to avoid overnight gap contamination.
-    # Group by date, compute intra-session log returns (first bar of each session gets NaN
-    # and is dropped), then reassemble.
-    def _intraday_log_rets(grp: pd.DataFrame) -> pd.Series:
-        return np.log(grp["close"] / grp["close"].shift(1))
-
-    min5["log_ret"] = (
-        min5.groupby(min5.index.normalize(), group_keys=False)
-        .apply(_intraday_log_rets)
-    )
-    # Drop NaN entries (first bar of each session)
+    # Compute log returns per date, masking overnight gaps
+    min5["log_ret"] = np.log(min5["close"] / min5["close"].shift(1))
+    # Identify first bar of each trading day by checking if date changed
+    dates = min5.index.normalize().values
+    prev_dates = np.concatenate([np.array([np.datetime64("NaT")]), dates[:-1]])
+    is_first_bar = (dates != prev_dates)
+    min5.loc[is_first_bar, "log_ret"] = np.nan
+    # Compute realized vol per week from non-NaN returns
     rv_5min = (
         (min5["log_ret"].dropna() ** 2)
-        .resample("W-FRI")
+        .resample("W-TUE")
         .sum()
         .pipe(np.sqrt)
     )
@@ -176,7 +218,7 @@ def build_features() -> pd.DataFrame:
     # 5. VIX features
     # ------------------------------------------------------------------
     logger.info("Computing VIX features...")
-    vix_weekly = vix["close"].resample("W-FRI").last()
+    vix_weekly = vix["close"].resample("W-TUE").last()
     vix_weekly.name = "vix_level"
     vix_change = vix_weekly.diff(1)
     vix_change.name = "vix_change_1w"
@@ -188,13 +230,13 @@ def build_features() -> pd.DataFrame:
     # (already weekly) as the realized vol proxy.
     # ------------------------------------------------------------------
     logger.info("Computing vol risk premium...")
-    # Build a realized vol series: use 5-min RV where available, else Parkinson
-    rv_combined = rv_5min.reindex(park_weekly.index)
-    rv_combined = rv_combined.fillna(park_weekly)  # park_weekly covers full history
-    rv_combined.name = "realized_vol_5min"         # keep column name consistent
-    rv_5min = rv_combined                          # replace sparse series with filled one
+    # Build a hybrid realized vol series: use 5-min RV where available,
+    # else fall back to Parkinson volatility for weeks >2 years ago.
+    rv_hybrid = rv_5min.reindex(park_weekly.index)
+    rv_hybrid = rv_hybrid.fillna(park_weekly)  # park_weekly covers full history
+    rv_hybrid.name = "realized_vol_5min"         # keep column name consistent for backward compat
 
-    rv_ann = rv_5min * np.sqrt(52)
+    rv_ann = rv_hybrid * np.sqrt(252)
     vix_aligned, rv_aligned = vix_weekly.align(rv_ann, join="left")
     vrp = vix_aligned / 100 - rv_aligned
     vrp.name = "vol_risk_premium"
@@ -209,6 +251,12 @@ def build_features() -> pd.DataFrame:
     range_4w_avg = weekly_range.shift(1).rolling(4).mean()
     range_4w_avg.name = "range_4w_avg"
 
+    # Previous week gap: (open - prev_close) / prev_close, lagged by 1
+    logger.info("Computing previous week gap...")
+    prev_week_gap = (weekly["open"] - weekly["close"].shift(1)) / weekly["close"].shift(1)
+    prev_week_gap = prev_week_gap.shift(1)
+    prev_week_gap.name = "prev_week_gap"
+
     # ------------------------------------------------------------------
     # 8. Bollinger Band width (daily close, 20-day, 2std → weekly last)
     # ------------------------------------------------------------------
@@ -221,83 +269,157 @@ def build_features() -> pd.DataFrame:
     bb_width.name = "bb_width"
 
     # ------------------------------------------------------------------
-    # 9. Days to expiry
+    # 9. 4-week momentum (lagged to avoid lookahead)
     # ------------------------------------------------------------------
-    logger.info("Computing days-to-expiry...")
-    # Nifty options expire every Thursday (weekly). week_end is always a Friday,
-    # so the next expiry Thursday is always 6 calendar days away.
-    all_fridays = weekly.index
-    dte = pd.Series(
-        [_days_to_next_expiry(f) for f in all_fridays],
-        index=all_fridays,
-        name="days_to_expiry",
+    logger.info("Computing 4-week momentum...")
+    return_4w = np.log(weekly["close"] / weekly["close"].shift(4)).shift(1)
+    return_4w = return_4w.replace([np.inf, -np.inf], np.nan)
+    return_4w.name = "return_4w"
+
+    # ------------------------------------------------------------------
+    # 10. Realized vol skewness (rolling 20 daily log-returns, resampled weekly)
+    # ------------------------------------------------------------------
+    logger.info("Computing realized vol skewness...")
+    daily_log_ret = np.log(daily["close"] / daily["close"].shift(1))
+    vol_skew_daily = daily_log_ret.rolling(20, min_periods=10).skew()
+    vol_skew = _resample_weekly_last(vol_skew_daily).shift(1)
+    vol_skew.name = "vol_skew"
+
+    # ------------------------------------------------------------------
+    # 10b. Implied Volatility Skew & Term Structure (from module15 / backfill proxy)
+    # ------------------------------------------------------------------
+    # NOTE: Historical option chains are not available in this repo for backfilling.
+    # Live data will use actual module15_iv_skew output. The synthetic proxies below
+    # are disabled by default (IV_SKEW_PROXY=0) to avoid silent feature drift.
+    # Enable with: export IV_SKEW_PROXY=1  (for research only)
+    _skew_proxy_enabled = str(os.environ.get("IV_SKEW_PROXY", "0")) in ("1", "true", "yes")
+    if _skew_proxy_enabled:
+        logger.warning("IV skew proxy ENABLED — features will drift from live Module 15 output")
+        skew_index = (vol_skew.fillna(0) * 0.05) + (vix_weekly.shift(1).fillna(15) / 100.0 * 0.2)
+        skew_index.name = "skew_index"
+
+        term_structure_spread = (vix_weekly.shift(1).fillna(15) / 100.0) - (vix_weekly.rolling(4).mean().shift(1).fillna(15) / 100.0)
+        term_structure_spread.name = "term_structure_spread"
+    else:
+        skew_index = pd.Series(float("nan"), index=weekly.index, name="skew_index")
+        term_structure_spread = pd.Series(float("nan"), index=weekly.index, name="term_structure_spread")
+
+    # ------------------------------------------------------------------
+    # 11. VIX z-score (deviation from 52-week rolling mean)
+    # ------------------------------------------------------------------
+    logger.info("Computing VIX z-score...")
+    vix_52w_mean = vix_weekly.rolling(52, min_periods=20).mean()
+    vix_52w_std  = vix_weekly.rolling(52, min_periods=20).std()
+    vix_zscore   = (vix_weekly - vix_52w_mean) / vix_52w_std.clip(lower=0.01)
+    vix_zscore.name = "vix_zscore"
+
+    # ------------------------------------------------------------------
+    # 12. Close position within weekly range (where did week close?)
+    # ------------------------------------------------------------------
+    logger.info("Computing close position within range...")
+    close_position = (weekly["close"] - weekly["low"]) / (weekly["high"] - weekly["low"])
+    close_position = close_position.replace([np.inf, -np.inf], np.nan).shift(1)
+    close_position.name = "close_position_in_range"
+
+    # ------------------------------------------------------------------
+    # 13. Trend strength proxy (|close-open| / true range, averaged weekly)
+    # ------------------------------------------------------------------
+    logger.info("Computing trend strength proxy...")
+    daily["tr_tmp"] = pd.concat([
+        daily["high"] - daily["low"],
+        (daily["high"] - daily["close"].shift(1)).abs(),
+        (daily["low"] - daily["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    daily["co_range"] = (daily["close"] - daily["open"]).abs()
+    daily["trend_str"] = daily["co_range"] / daily["tr_tmp"]
+    trend_str_weekly = daily["trend_str"].resample("W-TUE").mean().shift(1)
+    trend_str_weekly.name = "trend_strength_proxy"
+
+    # ------------------------------------------------------------------
+    # 14. Event week indicator
+    # ------------------------------------------------------------------
+    all_week_ends = weekly.index
+    logger.info("Computing event-week flag...")
+    is_event = pd.Series(
+        [_is_event_week(f) for f in all_week_ends],
+        index=all_week_ends,
+        name="is_event_week",
         dtype=float,
     )
 
     # ------------------------------------------------------------------
-    # 10. Regime-specific features (for HMM in engine_regime_detection)
-    # ------------------------------------------------------------------
-    logger.info("Computing regime-specific features...")
-    
-    # Trend strength: Compare current close to N-week ago
-    trend_5w = (daily["close"] - daily["close"].shift(35)) / daily["close"].shift(35)
-    trend_5w_weekly = _resample_weekly_last(trend_5w)
-    trend_5w_weekly.name = "trend_strength_5w"
-    
-    # Volatility of volatility: Standard deviation of daily returns
-    daily_returns = daily["close"].pct_change()
-    volatility_daily = daily_returns.rolling(14).std()
-    vol_of_vol = volatility_daily.rolling(21).std()
-    vol_of_vol_weekly = _resample_weekly_last(vol_of_vol)
-    vol_of_vol_weekly.name = "vol_of_vol"
-    
-    # Correlation proxy: Smoothed price momentum vs volatility
-    momentum_20 = daily_returns.rolling(20).mean()
-    mom_vol_corr = _resample_weekly_last(momentum_20)
-    mom_vol_corr.name = "momentum_strength"
-    
-    # Market regime indicator: Combine VIX change with price momentum
-    vix_momentum = vix["close"].pct_change()
-    vix_momentum_weekly = _resample_weekly_last(vix_momentum)
-    vix_momentum_weekly.name = "vix_momentum"
-
-    # ------------------------------------------------------------------
-    # 11. Target variable: log range
+    # 15. Target variable: log range
     # ------------------------------------------------------------------
     logger.info("Computing target variable log_range...")
     log_range = np.log(weekly["high"] / weekly["low"])
     log_range.name = "log_range"
 
     # ------------------------------------------------------------------
-    # 12. Merge all features
+    # 16. Merge all features
     # ------------------------------------------------------------------
     logger.info("Merging all features...")
+    # LAGGING: Most features must be shifted by 1 to represent state at START of week
     frames = [
-        atr5, atr14, atr21,
-        park_weekly, gk_weekly,
-        rv_5min,
-        vix_weekly, vix_change, vrp,
+        atr5.shift(1), atr14.shift(1), atr21.shift(1),
+        park_weekly.shift(1), gk_weekly.shift(1),
+        rv_hybrid.shift(1),
+        vix_weekly.shift(1), vix_change.shift(1), vrp.shift(1),
         range_1w, range_4w_avg,
-        bb_width,
-        dte,
-        # Regime-specific features
-        trend_5w_weekly, vol_of_vol_weekly, mom_vol_corr, vix_momentum_weekly,
+        prev_week_gap,
+        bb_width.shift(1),
+        return_4w,
+        vol_skew,
+        skew_index,
+        term_structure_spread,
+        vix_zscore.shift(1),
+        close_position,
+        trend_str_weekly,
+        is_event,
         log_range,
     ]
 
     df = pd.concat(frames, axis=1)
     df.index.name = "week_end"
 
-    # Keep only rows where weekly data exists
+    # ------------------------------------------------------------------
+    # 17. Merge macro features (if available)
+    # ------------------------------------------------------------------
+    # Keep only rows where weekly data exists (align index before macro merge)
     df = df[df.index.isin(weekly.index)]
+
+    macro_path = BASE_DIR / "data" / "macro_daily.parquet"
+    if macro_path.exists():
+        logger.info("Merging macro features...")
+        try:
+            from module1b_macro import build_macro_features
+            macro_feat = build_macro_features()
+            df = df.join(macro_feat, how="left")
+            # Forward-fill macro gaps (e.g., US holidays vs Indian trading)
+            macro_cols = [c for c in macro_feat.columns if c in df.columns]
+            df[macro_cols] = df[macro_cols].ffill(limit=2)
+            logger.info(f"Macro features merged: {macro_cols}")
+        except Exception as e:
+            logger.warning(f"Macro feature merge failed: {e}")
+    else:
+        logger.info("Macro data not found; skipping. Run module1b_macro.py to fetch.")
+
+    all_nan_cols = df.columns[df.isna().all()].tolist()
+    if all_nan_cols:
+        logger.info(f"Excluding all-NaN columns from dropna (restored as proxies after): {all_nan_cols}")
+        df = df.drop(columns=all_nan_cols)
 
     before = len(df)
     df = df.dropna()
     after = len(df)
     logger.info(f"Dropped {before - after} rows with NaN (warm-up period). Remaining: {after}")
 
+    # Restore empty proxy columns so downstream modules that reference
+    # them (module9_spreads) don't KeyError.
+    for c in all_nan_cols:
+        df[c] = np.nan
+
     # ------------------------------------------------------------------
-    # 13. Save
+    # 18. Save
     # ------------------------------------------------------------------
     logger.info(f"Saving feature matrix to {FEATURE_MATRIX_PATH}")
     df.to_parquet(FEATURE_MATRIX_PATH)

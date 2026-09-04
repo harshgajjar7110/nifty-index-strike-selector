@@ -4,7 +4,6 @@ Simulates iron condor P&L over the historical test set using model predictions.
 """
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -13,8 +12,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 from loguru import logger
+
+from config import cfg
+from utils_constants import REGIMES, load_regime_thresholds, extract_vix, assign_regime_series
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -24,8 +25,7 @@ DATA_PATH = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"
 WEEKLY_PATH = BASE_DIR / "data" / "nifty_weekly.parquet"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 
-WING_WIDTH_POINTS = 200    # distance from short to long strike (fixed)
-LOT_SIZE = 25              # Nifty lot size (₹ per point)
+LOT_SIZE = cfg.nifty_lot_size
 SKEW_PTS_PER_PERCENT_IMBALANCE = 25  # empirical: 1% breach diff → 25 pts skew
 
 # ---------------------------------------------------------------------------
@@ -34,21 +34,21 @@ SKEW_PTS_PER_PERCENT_IMBALANCE = 25  # empirical: 1% breach diff → 25 pts skew
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from module6_strikes import predict_range, generate_strikes, _load_config  # noqa: E402
+from module6_strikes import predict_range, generate_strikes, _get_vix_baseline  # noqa: E402
+from module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
+from module4b_risk import cvar  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Load configuration from module6 and environment
 # ---------------------------------------------------------------------------
-env_path = BASE_DIR / ".env"
-load_dotenv(dotenv_path=env_path)
 
 # Load VIX baseline from module6 config (ensures consistency with live trading)
-_, _, VIX_BASELINE, _ = _load_config()
+VIX_BASELINE = _get_vix_baseline()
 logger.info(f"VIX_BASELINE loaded from module6 config: {VIX_BASELINE:.2f}")
 
-# Load PREMIUM_POINTS_BASE from environment (with fallback)
-PREMIUM_POINTS_BASE = int(os.getenv("PREMIUM_POINTS_BASE", 80))
-logger.info(f"PREMIUM_POINTS_BASE loaded from environment: {PREMIUM_POINTS_BASE}")
+# Load PREMIUM_POINTS_BASE from config
+PREMIUM_POINTS_BASE = cfg.premium_points_base
+logger.info(f"PREMIUM_POINTS_BASE loaded from config: {PREMIUM_POINTS_BASE}")
 
 
 # ---------------------------------------------------------------------------
@@ -62,12 +62,84 @@ def _max_drawdown(cumulative_pnl: np.ndarray) -> float:
     return float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
 
 
-def _vix_regime(vix: float) -> str:
-    if vix < 15:
-        return "low"
-    elif vix < 20:
-        return "mid"
-    return "high"
+
+
+def _refit_garch_per_quarter(test_df: pd.DataFrame, cache: dict) -> dict:
+    """Refit GARCH per calendar quarter on data ≤ current quarter end, no lookahead.
+
+    Returns a dict keyed by ``week_end`` Timestamp → refit ``garch_sigma_mean`` for
+    that week. The fit is cached per quarter so we only fit ~N_quarters models.
+    The function silently returns an empty dict if the daily data file is missing.
+    """
+    daily_path = BASE_DIR / "data" / "nifty_daily.parquet"
+    if not daily_path.exists():
+        logger.warning("nifty_daily.parquet missing — skipping per-quarter GARCH refit")
+        return {}
+    try:
+        from arch import arch_model
+    except ImportError:
+        logger.warning("arch package unavailable — skipping per-quarter GARCH refit")
+        return {}
+
+    try:
+        daily = pd.read_parquet(daily_path)
+        daily = daily.sort_index()
+        close_col = None
+        for col in ("close", "Close", "CLOSE", "adj_close", "Adj Close"):
+            if col in daily.columns:
+                close_col = col
+                break
+        if close_col is None and len(daily.columns) > 0:
+            close_col = daily.columns[0]
+        if close_col is None:
+            return {}
+
+        closes = daily[close_col]
+        if hasattr(closes.index, "normalize"):
+            closes.index = closes.index.normalize()
+    except Exception as e:
+        logger.warning(f"Per-quarter GARCH: failed to load daily data ({e})")
+        return {}
+
+    overrides: dict = {}
+    quarter_starts = pd.to_datetime(test_df.index).to_period("Q").unique()
+    for q in quarter_starts:
+        if q in cache:
+            quarter_sigma = cache[q]
+        else:
+            q_start = max(q.start_time, closes.index.min())
+            q_end = q.end_time
+            hist = closes.loc[closes.index <= q_end]
+            if len(hist) < 60:
+                cache[q] = None
+                continue
+            returns = np.log(hist / hist.shift(1)).dropna() * 100
+            if len(returns) < 60:
+                cache[q] = None
+                continue
+            try:
+                model = arch_model(returns, vol="Garch", p=1, o=1, q=1, dist="skewt")
+                res = model.fit(disp="off")
+                cond_vol = res.conditional_volatility / 100
+                weekly_mean = cond_vol.resample("W-TUE").mean()
+                quarter_sigma = weekly_mean.to_dict()
+            except Exception as e:
+                logger.warning(f"Per-quarter GARCH fit failed for {q}: {e}")
+                quarter_sigma = None
+            cache[q] = quarter_sigma
+        if not quarter_sigma:
+            continue
+        for week_end, sigma in quarter_sigma.items():
+            try:
+                week_end_ts = pd.Timestamp(week_end).normalize()
+            except Exception:
+                continue
+            if week_end_ts in test_df.index and sigma is not None and not (isinstance(sigma, float) and np.isnan(sigma)):
+                overrides[week_end_ts] = float(sigma)
+
+    logger.info(f"Per-quarter GARCH: built {len(overrides)} weekly overrides "
+                f"({len(cache)} quarters fit)")
+    return overrides
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +202,8 @@ def run_backtest() -> dict:
     # 3. Walk-forward prediction loop
     # ------------------------------------------------------------------
     records = []
+    garch_cache: dict = {}
+    garch_override = _refit_garch_per_quarter(test_df, garch_cache)
 
     for week_end, feature_row in test_df.iterrows():
         # Actual log_range for this week
@@ -156,35 +230,42 @@ def run_backtest() -> dict:
         range_pred = predict_range(feature_row)
         log_range_p10 = range_pred["log_range_p10"]
         log_range_p90 = range_pred["log_range_p90"]
+        log_range_mu = range_pred.get("log_range_mu")
+        log_range_sigma = range_pred.get("log_range_sigma")
+        regime = range_pred.get("regime", "unknown")
 
         # Generate strikes (with VIX level if available)
-        vix_level: float = np.nan
-        for col in ("vix", "india_vix", "VIX", "INDIA_VIX", "vix_level"):
-            if col in feature_row.index:
-                try:
-                    val = float(feature_row[col])
-                    if val > 0:
-                        vix_level = val
-                        break
-                except (ValueError, TypeError):
-                    pass
+        vix_level = extract_vix(feature_row)
 
-        # Extract GARCH volatility
-        garch_vol = float(feature_row["garch_sigma_mean"]) if "garch_sigma_mean" in feature_row.index else None
+        # Extract GARCH volatility (override with per-quarter refit if available)
+        garch_vol = garch_override.get(week_end)
+        if garch_vol is None:
+            garch_vol = float(feature_row["garch_sigma_mean"]) if "garch_sigma_mean" in feature_row.index else None
 
         strikes = generate_strikes(
             current_close,
             log_range_p10,
             log_range_p90,
-            vix_level=vix_level if not np.isnan(vix_level) else None,
+            vix_level=vix_level,
             garch_vol_weekly=garch_vol,
+            log_range_mu=log_range_mu,
+            log_range_sigma=log_range_sigma,
         )
 
-        # Compute per-row premium scaled by VIX
-        vix_used = vix_level if not np.isnan(vix_level) else VIX_BASELINE
-        premium_pts = int(PREMIUM_POINTS_BASE * (vix_used / VIX_BASELINE))
-        premium_pts = max(60, min(120, premium_pts))  # clamp [60, 120]
-        max_loss_pts = WING_WIDTH_POINTS - premium_pts
+        vix_used = vix_level if vix_level is not None else VIX_BASELINE
+        bs_premium = estimate_ic_premium(
+            spot=current_close,
+            short_put=strikes["short_put"], long_put=strikes["long_put"],
+            short_call=strikes["short_call"], long_call=strikes["long_call"],
+            dte_days=5,
+            vix_level=vix_used,
+        )
+        premium_pts = max(bs_premium, 5.0)
+        wing_width_used = strikes.get("wing_width_pts", 200)
+        max_loss_pts = max(wing_width_used - premium_pts, 1.0)
+
+        cvar_95 = cvar(float(log_range_mu), float(log_range_sigma), 0.05) if log_range_mu and log_range_sigma else None
+        cvar_99 = cvar(float(log_range_mu), float(log_range_sigma), 0.01) if log_range_mu and log_range_sigma else None
 
         records.append({
             "week_end": week_end,
@@ -195,9 +276,15 @@ def run_backtest() -> dict:
             "long_call": strikes["long_call"],
             "log_range_p10": log_range_p10,
             "log_range_p90": log_range_p90,
+            "log_range_mu": log_range_mu,
+            "log_range_sigma": log_range_sigma,
+            "regime": regime,
+            "cvar_95": cvar_95,
+            "cvar_99": cvar_99,
             "actual_log_range": actual_log_range,
             "vix_level": vix_level,
             "premium_pts": premium_pts,
+            "wing_width_pts": wing_width_used,
             "max_loss_pts": max_loss_pts,
             "breach_prob_call": strikes.get("breach_prob_call"),
             "breach_prob_put": strikes.get("breach_prob_put"),
@@ -211,22 +298,31 @@ def run_backtest() -> dict:
     logger.info(f"Processed {len(results)} test weeks")
 
     # ------------------------------------------------------------------
-    # 4. P&L simulation (per-row premium)
+    # 4. P&L simulation (per-row premium + SL + Costs)
     # ------------------------------------------------------------------
-    pnl_list = []
+    pnl_gross_list = []
+    pnl_net_list = []
     won_list = []
     breach_up_list = []
     breach_down_list = []
+    costs_list = []
+
+    # Config for optimization
+    SL_MULTIPLIER = 3.0  # Stop Loss at 3x entry premium
+    SLIPPAGE_ENTRY = 1.0 # 1 pt slippage per leg on entry
+    SLIPPAGE_EXIT = 0.5  # 0.5 pt slippage per leg on exit (or expiry)
 
     for _, row in results.iterrows():
         close = row["current_close"]
         actual_log_range = row["actual_log_range"]
 
         if np.isnan(actual_log_range):
-            pnl_list.append(np.nan)
+            pnl_gross_list.append(np.nan)
+            pnl_net_list.append(np.nan)
             won_list.append(np.nan)
             breach_up_list.append(np.nan)
             breach_down_list.append(np.nan)
+            costs_list.append(0.0)
             continue
 
         actual_half_range = close * (np.exp(actual_log_range) - 1) / 2
@@ -237,26 +333,55 @@ def run_backtest() -> dict:
         premium_pts = row["premium_pts"]
         max_loss_pts = row["max_loss_pts"]
 
-        # Track individual breaches
+        # 1. Apply Entry Slippage
+        # Net premium received is lower than theoretical mid-price
+        entry_premium_net = apply_slippage(premium_pts, num_legs=4, slippage_per_leg=SLIPPAGE_ENTRY)
+
+        # 2. Simulate Outcome with 3x Stop Loss
         breach_up = actual_high > row["short_call"]
         breach_down = actual_low < row["short_put"]
+        won = not (breach_up or breach_down)
 
-        won = (actual_low >= row["short_put"]) and (actual_high <= row["short_call"])
-        pnl = premium_pts if won else -max_loss_pts
+        if won:
+            # Full premium collected (minus entry slippage)
+            gross_pnl = entry_premium_net
+        else:
+            # Implementation of 3x Stop Loss
+            # Total loss = (Entry Net Premium) - (3 * Theoretical Entry Premium)
+            # This reflects exiting when the leg price triples
+            gross_pnl = entry_premium_net - (SL_MULTIPLIER * premium_pts)
+            # Cap loss at maximum possible (using max for negative cap bounds)
+            gross_pnl = max(gross_pnl, -(max_loss_pts + (4 * SLIPPAGE_EXIT)))
 
-        pnl_list.append(pnl)
+        # 3. Apply NSE Transaction Costs
+        # Entry charges (Sell side)
+        entry_charges = calculate_nse_charges(premium_pts, num_legs=4, is_sell=True)
+        # Exit charges (Buy side or expiry settlement)
+        # On loss, use max_loss_pts as proxy for exit turnover; on win, use premium_pts
+        exit_charges = calculate_nse_charges(max_loss_pts if not won else premium_pts, num_legs=4, is_sell=False)
+        
+        total_charges_pts = entry_charges["cost_per_lot_pts"] + exit_charges["cost_per_lot_pts"]
+        # Exit slippage only applies on losing (early exited) trades. Options that expire worthless have no exit slippage.
+        exit_slippage_pts = 0 if won else (4 * SLIPPAGE_EXIT)
+        net_pnl = gross_pnl - total_charges_pts - exit_slippage_pts
+
+        pnl_gross_list.append(gross_pnl)
+        pnl_net_list.append(net_pnl)
         won_list.append(won)
         breach_up_list.append(breach_up)
         breach_down_list.append(breach_down)
+        costs_list.append(total_charges_pts)
 
-    results["pnl_points"] = pnl_list
+    results["pnl_points"] = pnl_net_list # We prioritize NET results now
+    results["pnl_gross"] = pnl_gross_list
     results["won"] = won_list
     results["breach_up"] = breach_up_list
     results["breach_down"] = breach_down_list
     results["pnl_inr"] = results["pnl_points"] * LOT_SIZE
+    results["txn_costs_pts"] = costs_list
 
     # Drop weeks where actual_log_range was unavailable
-    valid = results.dropna(subset=["pnl_points"])
+    valid = results.dropna(subset=["pnl_points"]).reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # 5. Metrics
@@ -280,16 +405,23 @@ def run_backtest() -> dict:
 
     # Breach rate by VIX regime
     regime_stats: dict = {}
+    cvar_stats: dict = {}
+    low_thresh, high_thresh = load_regime_thresholds()
+    regime_series = assign_regime_series(valid["vix_level"], low_thresh, high_thresh)
     for regime in ("low", "mid", "high"):
-        mask = valid["vix_level"].apply(
-            lambda v: _vix_regime(v) == regime if not np.isnan(v) else False
-        )
+        mask = regime_series == regime
         subset = valid[mask]
         if len(subset) > 0:
             breach_rate = float((subset["won"] == False).sum() / len(subset) * 100)  # noqa: E712
+            cvar_95_mean = float(subset["cvar_95"].mean()) if "cvar_95" in subset.columns else None
+            cvar_99_mean = float(subset["cvar_99"].mean()) if "cvar_99" in subset.columns else None
         else:
             breach_rate = np.nan
+            cvar_95_mean = None
+            cvar_99_mean = None
         regime_stats[f"breach_rate_{regime}_vix_pct"] = round(breach_rate, 2) if not np.isnan(breach_rate) else None
+        cvar_stats[f"cvar_95_{regime}"] = round(cvar_95_mean, 4) if cvar_95_mean is not None else None
+        cvar_stats[f"cvar_99_{regime}"] = round(cvar_99_mean, 4) if cvar_99_mean is not None else None
 
     # Compute premium statistics
     premium_stats = {
@@ -317,6 +449,24 @@ def run_backtest() -> dict:
     # Rough heuristic: 1% breach difference ≈ 25 pts of skew needed
     recommended_put_skew = int(max(0, skew_imbalance * SKEW_PTS_PER_PERCENT_IMBALANCE))
 
+    # POP vs Actual Validation — detect model drift
+    pop_accuracy = {}
+    if pop_stats.get("avg_pop_pct") is not None:
+        pop_error = round(float(pop_stats["avg_pop_pct"] - win_rate), 2)
+        call_error = round(float((pop_stats.get("avg_breach_prob_call_pct", 0) or 0) - breach_rate_up), 2)
+        put_error  = round(float((pop_stats.get("avg_breach_prob_put_pct", 0) or 0) - breach_rate_down), 2)
+        pop_accuracy = {
+            "pop_vs_winrate_error_pct": pop_error,
+            "breach_call_error_pct": call_error,
+            "breach_put_error_pct": put_error,
+        }
+        if abs(pop_error) > 5.0:
+            logger.warning(f"POP model drift: predicted={pop_stats['avg_pop_pct']:.1f}% vs actual={win_rate:.1f}% (error={pop_error:.1f}pp)")
+        if abs(call_error) > 5.0:
+            logger.warning(f"Call breach model drift: predicted={pop_stats.get('avg_breach_prob_call_pct', 0):.1f}% vs actual={breach_rate_up:.1f}% (error={call_error:.1f}pp)")
+        if abs(put_error) > 5.0:
+            logger.warning(f"Put breach model drift: predicted={pop_stats.get('avg_breach_prob_put_pct', 0):.1f}% vs actual={breach_rate_down:.1f}% (error={put_error:.1f}pp)")
+
     summary = {
         "total_trades": int(total_trades),
         "win_rate_pct": round(float(win_rate), 2),
@@ -326,15 +476,20 @@ def run_backtest() -> dict:
         "sharpe_ratio": round(sharpe, 4),
         "expectancy_per_trade_points": round(expectancy, 4),
         **regime_stats,
+        **cvar_stats,
         "premium_points_base": PREMIUM_POINTS_BASE,
-        "wing_width_points": WING_WIDTH_POINTS,
+        "wing_width_points": "dynamic (see backtest_results.csv column 'wing_width_pts')",
         **premium_stats,
         **pop_stats,
+        **pop_accuracy,
         "lot_size": LOT_SIZE,
         "breach_rate_up_pct": round(float(breach_rate_up), 2),
         "breach_rate_down_pct": round(float(breach_rate_down), 2),
         "skew_imbalance_pct": round(float(skew_imbalance), 2),
         "recommended_put_skew_pts": int(recommended_put_skew),
+        "avg_txn_cost_pts":     round(float(valid["txn_costs_pts"].mean()), 2),
+        "gross_expectancy_pts": round(float(valid["pnl_gross"].mean()), 2),
+        "net_expectancy_pts":   round(float(expectancy), 2),
     }
 
     logger.info(f"Backtest summary: {summary}")
