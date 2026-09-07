@@ -94,33 +94,15 @@ def run_calibration() -> dict:
     X_calib_all = df_clean[available_features].iloc[split_idx:]
     y_calib_all = df_clean[target_col].iloc[split_idx:]
     n = len(X_calib_all)
-    mid = int(n * 0.50)  # Split the holdout 50% for conformalization, 50% for evaluation
-    X_conf, y_conf = X_calib_all.iloc[:mid], y_calib_all.iloc[:mid]
-    X_eval, y_eval = X_calib_all.iloc[mid:], y_calib_all.iloc[mid:]
-
-    X_conf_arr = X_conf.values
-    y_conf_arr = y_conf.values
-    X_eval_arr = X_eval.values
-    y_eval_arr = y_eval.values
-    logger.info(f"Calibration set size: {n} samples (conf={mid}, eval={n - mid})")
+    X_conf_arr = X_calib_all.values
+    y_conf_arr = y_calib_all.values
+    logger.info(f"Calibration set size: {n} samples (global-only, no per-regime split)")
 
     low_thresh, high_thresh = _load_regime_thresholds()
     logger.info(f"Loaded regime thresholds: low={low_thresh}, high={high_thresh}")
 
-    # Build per-regime MAPIE models
     from mapie.regression import SplitConformalRegressor
 
-    regime_names = REGIMES
-    thresholds = {"low": low_thresh, "high": high_thresh}
-    mapie_per_regime = {}
-    coverage_per_regime = {}
-    calibration_method = {}
-
-    # Extract VIX column for masking
-    vix_col_idx = feature_columns.index("vix_level")
-
-    # Build global MAPIE first so it's available as a fallback for any
-    # per-regime conformal set that is too small to fit reliably.
     wrapper_global = RegimeLGBQuantileWrapper(
         lgb_models=lgb_models,
         feature_columns=feature_columns,
@@ -133,102 +115,66 @@ def run_calibration() -> dict:
         prefit=True,
     )
     mapie_global.conformalize(X_conf_arr, y_conf_arr)
-    logger.info("Global MAPIE conformalized on full conf set (for fallback)")
+    logger.info(f"Global MAPIE conformalized on {n} samples")
 
-    for regime in regime_names:
-        # Subset conformal and eval sets to this regime
+    vix_col_idx = feature_columns.index("vix_level")
+    X_eval_arr = X_conf_arr
+    y_eval_arr = y_conf_arr
+    coverage_per_regime = {}
+    calibration_method = {}
+    for regime in REGIMES:
         if regime == "low":
-            mask_conf = X_conf_arr[:, vix_col_idx] < thresholds["low"]
-            mask_eval = X_eval_arr[:, vix_col_idx] < thresholds["low"]
+            mask_eval = X_eval_arr[:, vix_col_idx] < low_thresh
         elif regime == "mid":
-            mask_conf = (X_conf_arr[:, vix_col_idx] >= thresholds["low"]) & \
-                        (X_conf_arr[:, vix_col_idx] < thresholds["high"])
-            mask_eval = (X_eval_arr[:, vix_col_idx] >= thresholds["low"]) & \
-                        (X_eval_arr[:, vix_col_idx] < thresholds["high"])
-        else:  # high
-            mask_conf = X_conf_arr[:, vix_col_idx] >= thresholds["high"]
-            mask_eval = X_eval_arr[:, vix_col_idx] >= thresholds["high"]
-
-        X_r_conf, y_r_conf = X_conf_arr[mask_conf], y_conf_arr[mask_conf]
+            mask_eval = (X_eval_arr[:, vix_col_idx] >= low_thresh) & (X_eval_arr[:, vix_col_idx] < high_thresh)
+        else:
+            mask_eval = X_eval_arr[:, vix_col_idx] >= high_thresh
         X_r_eval, y_r_eval = X_eval_arr[mask_eval], y_eval_arr[mask_eval]
-        logger.info(f"Regime {regime}: conf={len(X_r_conf)}, eval={len(X_r_eval)}")
-
-        if len(X_r_conf) < 7:
-            logger.warning(
-                f"Regime {regime}: only {len(X_r_conf)} conf samples (< 7) — "
-                f"using global MAPIE as fallback (calibration_method=global_fallback)"
-            )
-            mapie_per_regime[regime] = mapie_global
-            coverage_per_regime[regime] = None
-            calibration_method[regime] = "global_fallback"
-            continue
-
-        wrapper_r = RegimeLGBQuantileWrapper(
-            lgb_models=lgb_models,
-            feature_columns=feature_columns,
-            low_thresh=low_thresh,
-            high_thresh=high_thresh,
-        )
-        mapie_r = SplitConformalRegressor(
-            estimator=wrapper_r,
-            confidence_level=target_coverage,
-            prefit=True,
-        )
-        mapie_r.conformalize(X_r_conf, y_r_conf)
-
         if len(X_r_eval) >= 3:
-            y_pred_r, y_pis_r = mapie_r.predict_interval(X_r_eval)
-            # Handle different MAPIE versions
+            _, y_pis_r = mapie_global.predict_interval(X_r_eval)
             if len(y_pis_r.shape) == 3:
-                y_low_r = y_pis_r[:, 0, 0]
-                y_high_r = y_pis_r[:, 1, 0]
+                y_low_r, y_high_r = y_pis_r[:, 0, 0], y_pis_r[:, 1, 0]
             else:
-                y_low_r = y_pis_r[:, 0]
-                y_high_r = y_pis_r[:, 1]
-            covered_r = (y_low_r <= y_r_eval) & (y_r_eval <= y_high_r)
-            coverage_per_regime[regime] = float(np.mean(covered_r))
-            logger.info(f"Regime {regime} OOS coverage: {coverage_per_regime[regime]:.4f}")
+                y_low_r, y_high_r = y_pis_r[:, 0], y_pis_r[:, 1]
+            coverage_per_regime[regime] = float(np.mean((y_low_r <= y_r_eval) & (y_r_eval <= y_high_r)))
+            logger.info(f"Regime {regime} in-sample coverage: {coverage_per_regime[regime]:.4f} (n={len(X_r_eval)})")
         else:
             coverage_per_regime[regime] = None
+        calibration_method[regime] = "global_only"
 
-        mapie_per_regime[regime] = mapie_r
-        calibration_method[regime] = "per_regime"
-
-    # Clear stale per-regime MAPIE files before saving new ones
     for regime in REGIMES:
         stale_path = MODELS_DIR / f"mapie_{regime}.pkl"
         if stale_path.exists():
             stale_path.unlink()
-            logger.info(f"Removed stale {stale_path}")
+            logger.info(f"Removed stale per-regime {stale_path} (global-only mode)")
 
-    # Save per-regime MAPIE models
-    for regime, mapie_r in mapie_per_regime.items():
-        if mapie_r is not None:
-            out_path = MODELS_DIR / f"mapie_{regime}.pkl"
-            joblib.dump(mapie_r, out_path)
-            logger.info(f"Saved {regime} MAPIE to {out_path}")
-
-    # Save global fallback (original single MAPIE)
     joblib.dump(mapie_global, MODELS_DIR / "mapie_calibrated.pkl")
-    logger.info("Saved global fallback MAPIE to mapie_calibrated.pkl")
+    logger.info("Saved global MAPIE to mapie_calibrated.pkl")
 
     # Compute coverage: Use the evaluation set (X_eval_arr) which was NOT used for conformalization
     def compute_coverage_mapie() -> dict:
-        """Compute coverage using fitted global MAPIE model on out-of-sample eval set."""
-        # Get intervals from MAPIE
-        y_pred, y_pis = mapie_global.predict_interval(X_eval_arr)
-        
-        # y_pis shape is (n_samples, 2, 1) in some MAPIE versions
-        if len(y_pis.shape) == 3:
-            y_low = y_pis[:, 0, 0]
-            y_high = y_pis[:, 1, 0]
-        else:
-            y_low = y_pis[:, 0]
-            y_high = y_pis[:, 1]
-        
-        covered = (y_low <= y_eval_arr) & (y_eval_arr <= y_high)
-        actual_coverage = np.mean(covered)
-        
+        """Honest OOS coverage via 3-fold TimeSeriesSplit over the holdout."""
+        from sklearn.model_selection import TimeSeriesSplit
+        tscv = TimeSeriesSplit(n_splits=3)
+        covered_all, low_all, high_all, y_all = [], [], [], []
+        for tr_idx, te_idx in tscv.split(X_conf_arr):
+            m = SplitConformalRegressor(estimator=wrapper_global, confidence_level=target_coverage, prefit=True)
+            m.conformalize(X_conf_arr[tr_idx], y_conf_arr[tr_idx])
+            _, y_pis_cv = m.predict_interval(X_conf_arr[te_idx])
+            if len(y_pis_cv.shape) == 3:
+                low_cv, high_cv = y_pis_cv[:, 0, 0], y_pis_cv[:, 1, 0]
+            else:
+                low_cv, high_cv = y_pis_cv[:, 0], y_pis_cv[:, 1]
+            y_te = y_conf_arr[te_idx]
+            covered_all.append((low_cv <= y_te) & (y_te <= high_cv))
+            low_all.append(low_cv)
+            high_all.append(high_cv)
+            y_all.append(y_te)
+        covered = np.concatenate(covered_all)
+        y_low = np.concatenate(low_all)
+        y_high = np.concatenate(high_all)
+        y_eval_cv = np.concatenate(y_all)
+        actual_coverage = float(np.mean(covered))
         half_width = (y_high - y_low) / 2
         mid = (y_low + y_high) / 2
 
@@ -236,7 +182,7 @@ def run_calibration() -> dict:
             "actual_coverage": float(actual_coverage),
             "_mid": mid,
             "_half_width": half_width,
-            "_y_test": y_eval_arr,
+            "_y_test": y_eval_cv,
         }
 
     coverage_results = compute_coverage_mapie()
@@ -250,18 +196,27 @@ def run_calibration() -> dict:
     if actual_coverage < target_coverage:
         logger.warning(f"Coverage {actual_coverage:.4f} is below target {target_coverage:.2f}")
 
-    # Calibration curve: compute real empirical coverage at each nominal level
+    # Calibration curve: honest CV empirical coverage at each nominal level
+    from sklearn.model_selection import TimeSeriesSplit as _TSCV
     nominal_levels = np.arange(0.70, 0.96, 0.05)
     empirical_levels = []
     for lvl in nominal_levels:
-        m = SplitConformalRegressor(estimator=wrapper_global, confidence_level=lvl, prefit=True)
-        m.conformalize(X_conf_arr, y_conf_arr)
-        _, pis = m.predict_interval(X_eval_arr)
-        if len(pis.shape) == 3:
-            low, high = pis[:, 0, 0], pis[:, 1, 0]
-        else:
-            low, high = pis[:, 0], pis[:, 1]
-        empirical_levels.append(np.mean((low <= y_eval_arr) & (y_eval_arr <= high)))
+        cv_covered = []
+        for tr_idx, te_idx in _TSCV(n_splits=3).split(X_conf_arr):
+            try:
+                m = SplitConformalRegressor(estimator=wrapper_global, confidence_level=float(lvl), prefit=True)
+                m.conformalize(X_conf_arr[tr_idx], y_conf_arr[tr_idx])
+                _, pis = m.predict_interval(X_conf_arr[te_idx])
+            except ValueError as e:
+                logger.warning(f"lvl={float(lvl):.2f}: skipped fold ({e})")
+                continue
+            if len(pis.shape) == 3:
+                low, high = pis[:, 0, 0], pis[:, 1, 0]
+            else:
+                low, high = pis[:, 0], pis[:, 1]
+            y_te = y_conf_arr[te_idx]
+            cv_covered.append(np.mean((low <= y_te) & (y_te <= high)))
+        empirical_levels.append(float(np.mean(cv_covered)) if cv_covered else float("nan"))
 
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.plot(nominal_levels, empirical_levels, "o-", color="steelblue",

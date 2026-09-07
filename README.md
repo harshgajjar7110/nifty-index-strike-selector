@@ -83,17 +83,17 @@ WING_WIDTH_MID_VIX=400
 WING_WIDTH_HIGH_VIX=500
 
 # Quantile alphas per regime (configurable via .env)
-ALPHA_LOW_P10=0.10
-ALPHA_LOW_P90=0.90
-ALPHA_MID_P10=0.15
-ALPHA_MID_P90=0.85
-ALPHA_HIGH_P10=0.10
-ALPHA_HIGH_P90=0.90
+ALPHA_LOW_P10=0.075
+ALPHA_LOW_P90=0.925
+ALPHA_MID_P10=0.075
+ALPHA_MID_P90=0.925
+ALPHA_HIGH_P10=0.075
+ALPHA_HIGH_P90=0.925
 
 # Walk-forward settings
 WF_INITIAL_TRAIN_WEEKS=120
 WF_RETRAIN_EVERY_WEEKS=4
-WF_CALIBRATION_WEEKS=40
+WF_CALIBRATION_WEEKS=60
 WF_SL_MULTIPLIER=3.0
 WF_MAX_VIX_TRADE=22
 WF_MIN_PREMIUM_PTS=20
@@ -173,7 +173,8 @@ Outputs `outputs/monitor_report_YYYY-MM-DD.json` with `RETRAIN` / `REVIEW_FEATUR
 3. **Buffer Scaling:**
    ```
    vix_scalar = current_vix / vix_baseline
-   effective_buffer = clamp(buffer_pts * vix_scalar, min_buffer_pts, 150)
+   max_buffer_pts = max(300, IC_MAX_EXTRA_BUFFER_PTS)
+   effective_buffer = clamp(buffer_pts * vix_scalar, min_buffer_pts, max_buffer_pts)
    ```
 
 4. **Range → Strikes:**
@@ -211,8 +212,7 @@ Outputs `outputs/monitor_report_YYYY-MM-DD.json` with `RETRAIN` / `REVIEW_FEATUR
 | `models/lgb_low.pkl` | serialized | LightGBM quantile models (VIX < low_thresh) |
 | `models/lgb_mid.pkl` | serialized | LightGBM quantile models (mid regime) |
 | `models/lgb_high.pkl` | serialized | LightGBM quantile models (VIX ≥ high_thresh) |
-| `models/mapie_calibrated.pkl` | serialized | Global MAPIE conformal calibrator |
-| `models/mapie_low.pkl` | serialized | Per-regime MAPIE (fallback) |
+| `models/mapie_calibrated.pkl` | serialized | Global MAPIE conformal calibrator (global-only; per-regime splits removed — conf sets starved below n=7) |
 | `models/garch_model.pkl` | serialized | Fitted GJR-GARCH model |
 | `models/regime_model_meta.json` | metadata | Model sources & training sizes |
 | `models/feature_columns.pkl` | list | Feature names (training order) |
@@ -261,12 +261,12 @@ python run_pipeline.py --mode walkforward
 
 | Metric | Static Backtest | Walk-Forward |
 |--------|----------------|--------------|
-| Win rate | ~96% | ~91% |
-| Sharpe | ~0.82 | ~0.44 |
-| Max drawdown | ~421 pts | ~1,090 pts |
-| Expectancy/trade | ~8.7 pts | ~5.5 pts |
+| Win rate | 86.3% | 89.7% |
+| Sharpe | 0.54 | 3.60 |
+| Max drawdown | 463 pts | 306 pts |
+| Expectancy/trade | 3.7 pts | 20.9 pts |
 
-> **Note:** Walk-forward is the more realistic benchmark because it simulates live retraining and out-of-sample prediction. The gap between static and walk-forward (~5pp win rate) quantifies overfitting.
+> **Note:** Measured 2026-09-07 after global-only MAPIE + 0.075/0.925 alphas. Walk-forward is the realistic benchmark (expanding window + 60-week global MAPIE retrain). Static uses a fixed 80pt premium base and understates premium vs live BS pricing — trust walk-forward. Honest OOS conformal coverage is ~69% vs 85% target (prior 84.6% was in-sample inflated); monitor still flags `COVERAGE_DECAY` — needs 10y history / pooled model next.
 
 ### Tuning Guide
 

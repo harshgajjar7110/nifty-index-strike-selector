@@ -32,12 +32,12 @@ class _Config(BaseSettings):
     # ------------------------------------------------------------------
     # Model / calibration
     # ------------------------------------------------------------------
-    alpha_low_p10: float = Field(default=0.10, ge=0.01, le=0.49)
-    alpha_low_p90: float = Field(default=0.90, ge=0.51, le=0.99)
-    alpha_mid_p10: float = Field(default=0.15, ge=0.01, le=0.49)
-    alpha_mid_p90: float = Field(default=0.85, ge=0.51, le=0.99)
-    alpha_high_p10: float = Field(default=0.10, ge=0.01, le=0.49)
-    alpha_high_p90: float = Field(default=0.90, ge=0.51, le=0.99)
+    alpha_low_p10: float = Field(default=0.075, ge=0.01, le=0.49)
+    alpha_low_p90: float = Field(default=0.925, ge=0.51, le=0.99)
+    alpha_mid_p10: float = Field(default=0.075, ge=0.01, le=0.49)
+    alpha_mid_p90: float = Field(default=0.925, ge=0.51, le=0.99)
+    alpha_high_p10: float = Field(default=0.075, ge=0.01, le=0.49)
+    alpha_high_p90: float = Field(default=0.925, ge=0.51, le=0.99)
     regime_recent_only_years: float | None = Field(default=2.0, ge=0.0, le=10.0, description="If > 0, optimize regime thresholds on the most recent N years of training data. 0 = use full history.")
 
     # ------------------------------------------------------------------

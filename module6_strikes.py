@@ -151,8 +151,8 @@ def predict_range(feature_row: pd.Series) -> dict:
     low_thresh, high_thresh = load_regime_thresholds()
     regime = "low" if vix < low_thresh else ("mid" if vix < high_thresh else "high")
 
-    # Determine which MAPIE model to use
-    mapie_model = mapie_per_regime.get(regime, mapie_global)
+    # Prefer global MAPIE (per-regime conf sets starve below n=7); regime fallback only if global missing
+    mapie_model = mapie_global if mapie_global is not None else mapie_per_regime.get(regime)
     if regime not in cfg.regime_alphas:
         raise KeyError(
             f"Regime '{regime}' not found in cfg.regime_alphas. "
@@ -281,9 +281,10 @@ def generate_strikes(
         wing_width = wing_width_config["high"]
     logger.info(f"Dynamic wing width: {wing_width} pts (VIX={vix_level:.1f})")
 
-    # Compute VIX scalar and effective buffer
+    # Compute VIX scalar and effective buffer (upper cap follows IC_MAX_EXTRA_BUFFER_PTS, not hardcoded 150)
     vix_scalar = vix_level / vix_baseline
-    effective_buffer = np.clip(buffer_pts * vix_scalar, min_buffer_pts, 150)
+    max_buffer_pts = max(300, int(cfg.ic_max_extra_buffer_pts))
+    effective_buffer = np.clip(buffer_pts * vix_scalar, min_buffer_pts, max_buffer_pts)
 
     # Calm-market tighten: if VIX low AND GARCH vol low, reduce buffer by 15%
     if (
