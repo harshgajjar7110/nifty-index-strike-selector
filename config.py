@@ -9,8 +9,8 @@ Usage:
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR
@@ -58,6 +58,7 @@ class _Config(BaseSettings):
     wf_sl_multiplier: float = Field(default=3.0, ge=1.0, le=10.0)
     wf_slippage_entry: float = Field(default=1.0, ge=0.0, le=10.0)
     wf_slippage_exit: float = Field(default=0.5, ge=0.0, le=10.0)
+    wf_min_cost_cover_mult: float = Field(default=3.0, ge=1.0, le=10.0, description="Skip weeks where premium < mult * round-trip cost (charges + slippage).")
 
     # ------------------------------------------------------------------
     # Monitoring
@@ -127,10 +128,11 @@ class _Config(BaseSettings):
     ic_min_pop: float = Field(default=0.75, ge=0.0, le=1.0)
     ic_max_breach_prob_per_leg: float = Field(default=0.15, ge=0.0, le=1.0)
 
-    class Config:
-        env_file = BASE_DIR / ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"  # Allow other env vars without error
+    model_config = SettingsConfigDict(
+        env_file=str(BASE_DIR / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     # ------------------------------------------------------------------
     # Convenience properties

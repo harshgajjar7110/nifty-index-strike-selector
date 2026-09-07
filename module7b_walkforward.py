@@ -466,8 +466,13 @@ def run_walkforward_backtest() -> dict:
         premium_pts = row["premium_pts"]
 
         # --- Filters ---
-        # 1. Premium floor: skip low-premium weeks (bad R/R)
-        if premium_pts < WF_MIN_PREMIUM_PTS:
+        # 1. Premium floor: fixed minimum, or cost-cover multiple of round-trip cost
+        max_loss_proxy = max(row["wing_width_pts"] - premium_pts, 1.0)
+        entry_cost_pts = calculate_nse_charges(premium_pts, num_legs=4, is_sell=True)["cost_per_lot_pts"]
+        exit_cost_pts = calculate_nse_charges(max_loss_proxy, num_legs=4, is_sell=False)["cost_per_lot_pts"]
+        roundtrip_pts = entry_cost_pts + exit_cost_pts + 4 * SLIPPAGE_ENTRY + 4 * SLIPPAGE_EXIT
+        min_premium_pts = max(WF_MIN_PREMIUM_PTS, cfg.wf_min_cost_cover_mult * roundtrip_pts)
+        if premium_pts < min_premium_pts:
             pnl_gross_list.append(np.nan)
             pnl_net_list.append(np.nan)
             won_list.append(np.nan)

@@ -82,7 +82,11 @@ def run_calibration() -> dict:
         missing = set(feature_columns) - set(available_features)
         logger.warning(f"Missing feature columns in data: {missing}")
 
-    df_clean = df[available_features + [target_col]].dropna()
+    usable_features = [c for c in available_features if df[c].notna().any()]
+    dead = sorted(set(available_features) - set(usable_features))
+    if dead:
+        logger.warning(f"Excluding all-NaN features from calibration: {dead}")
+    df_clean = df[available_features + [target_col]].dropna(subset=usable_features + [target_col])
     X = df_clean[available_features].values
     y = df_clean[target_col].values
 

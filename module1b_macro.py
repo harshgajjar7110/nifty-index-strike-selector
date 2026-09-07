@@ -7,6 +7,7 @@ Assets: US VIX, S&P 500, Crude Oil (Brent), USD/INR, US 10Y Treasury yield.
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from loguru import logger
@@ -108,8 +109,8 @@ def build_macro_features() -> pd.DataFrame:
     Build weekly macro features aligned to Friday week-ends.
     Returns DataFrame with columns:
       us_vix_level, spx_return_1w, spx_return_4w, spx_volatility_20d,
-      crude_return_1w, usd_inr_level, usd_inr_change_1w,
-      us_10y_level, us_10y_change_1w, term_premium_proxy
+      crude_return_1w, usd_inr_zscore_52w, usd_inr_change_1w,
+      us_10y_zscore_52w, us_10y_change_1w
     """
     if not MACRO_PARQUET.exists():
         raise FileNotFoundError("Run fetch_macro_daily() first")
@@ -143,17 +144,15 @@ def build_macro_features() -> pd.DataFrame:
     crude = weekly["crude"]
     crude_ret_1w = crude.pct_change().rename("crude_return_1w")
 
-    # 5. USD/INR
-    usd_inr_level = weekly["usd_inr"].rename("usd_inr_level")
+    # 5. USD/INR — 52w rolling z-score instead of raw level (non-stationary)
+    usd_inr_roll = weekly["usd_inr"].rolling(52, min_periods=26)
+    usd_inr_z = ((weekly["usd_inr"] - usd_inr_roll.mean()) / usd_inr_roll.std()).replace([np.inf, -np.inf], np.nan).rename("usd_inr_zscore_52w")
     usd_inr_chg_1w = weekly["usd_inr"].pct_change().rename("usd_inr_change_1w")
 
-    # 6. US 10Y yield
-    us_10y_level = weekly["us_10y"].rename("us_10y_level")
+    # 6. US 10Y yield — 52w rolling z-score instead of raw level (non-stationary)
+    us_10y_roll = weekly["us_10y"].rolling(52, min_periods=26)
+    us_10y_z = ((weekly["us_10y"] - us_10y_roll.mean()) / us_10y_roll.std()).replace([np.inf, -np.inf], np.nan).rename("us_10y_zscore_52w")
     us_10y_chg_1w = weekly["us_10y"].diff().rename("us_10y_change_1w")
-
-    # 7. Term premium proxy (US 10Y yield - India VIX as rough risk-free spread)
-    # This will be merged later with India VIX; placeholder here
-    term_premium = us_10y_level.rename("us_10y_level_raw")
 
     frames = [
         us_vix_level.shift(1),
@@ -161,9 +160,9 @@ def build_macro_features() -> pd.DataFrame:
         spx_ret_4w.shift(1),
         spx_vol_20d.shift(1),
         crude_ret_1w.shift(1),
-        usd_inr_level.shift(1),
+        usd_inr_z.shift(1),
         usd_inr_chg_1w.shift(1),
-        us_10y_level.shift(1),
+        us_10y_z.shift(1),
         us_10y_chg_1w.shift(1),
     ]
 

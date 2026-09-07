@@ -62,3 +62,7 @@ debug_*.py
 
 # Temporary directories
 .tmp/
+
+# AI assistant scratch files
+.kilo/
+.claude/
