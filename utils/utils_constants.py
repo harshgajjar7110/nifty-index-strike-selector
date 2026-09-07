@@ -10,7 +10,7 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 
-BASE_DIR = Path(__file__).parent
+from config import REPO_ROOT as BASE_DIR
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Regime Constants

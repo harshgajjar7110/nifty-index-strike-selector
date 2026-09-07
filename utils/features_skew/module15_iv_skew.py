@@ -5,14 +5,10 @@ and Term Structure (Front month IV - Back month IV) using existing black_scholes
 """
 
 from loguru import logger
-import sys
-from pathlib import Path
 
-# Add project root to path
-BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE_DIR))
+from config import REPO_ROOT as BASE_DIR
 
-from black_scholes import implied_volatility, black_scholes_delta
+from utils.black_scholes import implied_volatility, black_scholes_delta
 
 def compute_option_metrics(spot: float, strike: float, price: float, dte_days: int, option_type: str) -> dict:
     """Computes IV and Delta for a given option price using existing black_scholes logic."""

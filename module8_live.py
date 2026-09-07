@@ -16,7 +16,7 @@ from pathlib import Path
 from loguru import logger
 
 from config import cfg
-from utils_constants import extract_vix
+from utils.utils_constants import extract_vix
 
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
@@ -164,7 +164,7 @@ def run_live_pipeline() -> dict:
         logger.info(f"[Step 5.5] {step}")
         oi_data = None
         try:
-            from module11_option_chain import fetch_option_chain
+            from data_fetch.module11_option_chain import fetch_option_chain
             oi_data = fetch_option_chain()
             if oi_data:
                 if oi_data.get("atm_iv"):
@@ -178,7 +178,7 @@ def run_live_pipeline() -> dict:
             logger.warning(f"Option chain fetch failed (non-fatal): {e11} — GARCH-only mode")
             # H7: Check for stale cache as fallback
             try:
-                from module11_option_chain import CACHE_FILE
+                from data_fetch.module11_option_chain import CACHE_FILE
                 if CACHE_FILE.exists():
                     cached = json.loads(CACHE_FILE.read_text())
                     fetched_at = datetime.fromisoformat(cached.get("fetched_at", "2000-01-01"))
@@ -196,7 +196,7 @@ def run_live_pipeline() -> dict:
         # ------------------------------------------------------------------
         step = "credit spread generation (module9)"
         logger.info(f"[Step 6] {step}")
-        from module9_spreads import generate_all_spreads
+        from spreads.module9_spreads import generate_all_spreads
 
         week_label = date.today().isoformat()
 
@@ -211,7 +211,7 @@ def run_live_pipeline() -> dict:
         # Step 6.5 — Capital-aware sizing (module12, optional)
         # ------------------------------------------------------------------
         try:
-            from module12_capital import find_safest_viable_spread, _load_capital_config
+            from spreads.module12_capital import find_safest_viable_spread, _load_capital_config
             logger.info("[Step 6.5] capital-aware strike selection (module12)")
             cap_cfg = _load_capital_config()
 

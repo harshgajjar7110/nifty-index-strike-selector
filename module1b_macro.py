@@ -11,7 +11,7 @@ import pandas as pd
 import yfinance as yf
 from loguru import logger
 
-from retry_utils import retry
+from utils.retry_utils import retry
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"

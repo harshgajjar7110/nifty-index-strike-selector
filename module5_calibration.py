@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from loguru import logger
 from config import cfg
-from models_utils import RegimeLGBQuantileWrapper
-from utils_constants import REGIMES
+from utils.models_utils import RegimeLGBQuantileWrapper
+from utils.utils_constants import REGIMES
 
 BASE_DIR = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"

@@ -15,7 +15,7 @@ import pandas as pd
 from loguru import logger
 
 from config import cfg
-from utils_constants import REGIMES, load_regime_thresholds, extract_vix, assign_regime_series
+from utils.utils_constants import REGIMES, load_regime_thresholds, extract_vix, assign_regime_series
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -35,8 +35,8 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from module6_strikes import predict_range, generate_strikes, _get_vix_baseline  # noqa: E402
-from module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
-from module4b_risk import cvar  # noqa: E402
+from spreads.module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
+from spreads.module4b_risk import cvar  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Load configuration from module6 and environment

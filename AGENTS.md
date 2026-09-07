@@ -270,6 +270,27 @@ research/
 ├── module7b_walkforward.py    # M7b: expanding-window walk-forward
 ├── module8_live.py            # M8: Sunday-night live runner
 ├── module13_monitor.py        # M13: drift & coverage monitor
+├── utils/                     # Shared utility package
+│   ├── __init__.py
+│   ├── retry_utils.py         # Retry decorator (imported by M1, M1b)
+│   ├── black_scholes.py       # BS pricing (imported by spreads, features_skew)
+│   ├── models_utils.py        # MAPIE wrappers, breach probability, regime wrapper
+│   ├── utils_constants.py     # Regimes, thresholds, helpers
+│   └── features_skew/         # IV skew feature engineering
+│       ├── __init__.py
+│       ├── module15_iv_skew.py
+│       └── module15b_plot_surface.py
+├── spreads/                   # Credit spread subsystem
+│   ├── __init__.py
+│   ├── module4b_risk.py       # Pure risk analysis (breach_prob, POP, CVaR)
+│   ├── module9_spreads.py     # Credit spread generation
+│   ├── module10_nse_costs.py  # NSE transaction costs & slippage
+│   └── module12_capital.py    # Capital-aware strike selection
+├── data_fetch/                # NSE data-fetching modules
+│   ├── __init__.py
+│   ├── module11_option_chain.py  # NSE option chain via jugaad-data
+│   └── module11b_nse_scraper.py  # NSE option chain scraper
+├── tests/                     # Test files
 ├── requirements.txt
 ├── .env / .env.example        # gitignore `.env`
 ├── data/                      # Parquet files

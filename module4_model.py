@@ -18,7 +18,7 @@ from loguru import logger
 from sklearn.model_selection import TimeSeriesSplit
 
 from config import cfg
-from utils_constants import REGIMES, DEFAULT_REGIME_LOW_THRESH, DEFAULT_REGIME_HIGH_THRESH
+from utils.utils_constants import REGIMES, DEFAULT_REGIME_LOW_THRESH, DEFAULT_REGIME_HIGH_THRESH
 
 BASE_DIR = Path(__file__).parent
 DATA_PATH = BASE_DIR / "data" / "feature_matrix_with_garch.parquet"

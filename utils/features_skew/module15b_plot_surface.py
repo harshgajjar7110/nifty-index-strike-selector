@@ -1,13 +1,9 @@
-import sys
-from pathlib import Path
 import plotly.graph_objects as go
 from datetime import datetime
 
-# Setup paths
-BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE_DIR))
+from config import REPO_ROOT as BASE_DIR
 
-from module11_option_chain import _fetch_raw_jugaad, _parse_expiry
+from data_fetch.module11_option_chain import _fetch_raw_jugaad, _parse_expiry
 
 def generate_volatility_surface():
     print("Fetching live option chain from NSE...")

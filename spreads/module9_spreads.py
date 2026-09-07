@@ -4,7 +4,7 @@ Implements bull put and bear call credit spreads across multiple expiries (weekl
 Includes Black-Scholes premium estimation and direction signal detection.
 
 Usage:
-    from module9_spreads import generate_all_spreads
+    from spreads.module9_spreads import generate_all_spreads
     results = generate_all_spreads(feature_row, spot, vix_level, garch_vol)
     # Outputs to outputs/spreads_live.json
 """
@@ -19,15 +19,15 @@ import pandas as pd
 from scipy.stats import norm
 from loguru import logger
 
-from config import cfg
-from utils_constants import REGIMES, load_regime_thresholds
+from config import REPO_ROOT, cfg
+from utils.utils_constants import REGIMES, load_regime_thresholds
 from module6_strikes import round_to_strike, predict_range
-from module10_nse_costs import apply_slippage
+from spreads.module10_nse_costs import apply_slippage
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BASE_DIR = Path(__file__).parent
+BASE_DIR = REPO_ROOT
 OUTPUTS_DIR = BASE_DIR / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -80,7 +80,7 @@ def _get_strike_iv(
 ) -> float | None:
     """Look up per-strike IV from chain. Uses stored impliedVolatility primarily;
     falls back to implied_volatility() from market price, then interpolation."""
-    from black_scholes import implied_volatility
+    from utils.black_scholes import implied_volatility
     iv_key = "put_iv" if side == "put" else "call_iv"
     price_key = "put_price" if side == "put" else "call_price"
     k = int(round(strike / 50) * 50)
@@ -231,7 +231,7 @@ def estimate_bs_price(
     vol_skew_factor: float = 0.0,
 ) -> float:
     """Estimate theoretical option price via Black-Scholes with optional vol skew."""
-    from black_scholes import bs_price_with_skew
+    from utils.black_scholes import bs_price_with_skew
     return bs_price_with_skew(S, K, T_years, sigma_annual, option_type, r, q, vol_skew_factor)
 
 def estimate_spread_premium(
@@ -411,13 +411,13 @@ def generate_credit_spread(
     # Primary — chain IV
     strike_iv = _get_strike_iv(_strikes, short_strike, spot, side, atm_iv_fallback=None)
     if strike_iv and strike_iv > 0.01:
-        from module4b_risk import pop_from_chain_iv
+        from spreads.module4b_risk import pop_from_chain_iv
         pop_pct = pop_from_chain_iv(short_strike, spot, dte_days, strike_iv, r, q, side)
 
     # Secondary — log_range model
     if pop_pct is None and log_range_mu is not None and log_range_sigma is not None and log_range_sigma > 0:
         try:
-            from module4b_risk import breach_probability
+            from spreads.module4b_risk import breach_probability
             breach_p = breach_probability(short_strike, log_range_mu, log_range_sigma, spot, side)
             pop_pct = float(1 - breach_p)
         except Exception as e:
@@ -425,7 +425,7 @@ def generate_credit_spread(
 
     # Tertiary — GARCH lognormal (unified via pop_from_chain_iv)
     if pop_pct is None and garch_vol:
-        from module4b_risk import pop_from_chain_iv
+        from spreads.module4b_risk import pop_from_chain_iv
         # Annualize the daily GARCH vol: garch_vol * sqrt(252)
         garch_vol_annual = garch_vol * np.sqrt(252)
         pop_pct = pop_from_chain_iv(short_strike, spot, dte_days, garch_vol_annual, r, q, side)

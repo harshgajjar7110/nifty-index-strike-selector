@@ -17,10 +17,10 @@ from loguru import logger
 from scipy.stats import norm
 
 from config import cfg
-from utils_constants import REGIMES, load_regime_thresholds, extract_vix
+from utils.utils_constants import REGIMES, load_regime_thresholds, extract_vix
 
 try:
-    from module4b_risk import breach_probability
+    from spreads.module4b_risk import breach_probability
 except ImportError:
     breach_probability = None
 

@@ -5,16 +5,13 @@ Finds the safest (most OTM) short strike that still delivers the target return,
 given a capital budget and risk limit. Supports both weekly and monthly expiries.
 """
 
-from pathlib import Path
 from math import sqrt, log, exp
 from scipy.stats import norm
 import numpy as np
 
 from config import cfg
-from module9_spreads import estimate_spread_premium, NIFTY_LOT_SIZE
+from spreads.module9_spreads import estimate_spread_premium, NIFTY_LOT_SIZE
 from module6_strikes import round_to_strike
-
-BASE_DIR = Path(__file__).parent
 
 
 def _load_capital_config() -> dict:

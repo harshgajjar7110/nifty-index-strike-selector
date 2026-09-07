@@ -11,7 +11,7 @@ import pandas as pd
 import yfinance as yf
 from loguru import logger
 
-from retry_utils import retry
+from utils.retry_utils import retry
 
 # ---------------------------------------------------------------------------
 # Constants

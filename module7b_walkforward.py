@@ -43,9 +43,9 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(BASE_DIR))
 
 from module6_strikes import generate_strikes
-from module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
-from utils_constants import REGIMES, load_regime_thresholds, assign_regime_series
-from models_utils import RegimeLGBQuantileWrapper, extract_pis, predict_mu_sigma_p90
+from spreads.module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
+from utils.utils_constants import REGIMES, load_regime_thresholds, assign_regime_series
+from utils.models_utils import RegimeLGBQuantileWrapper, extract_pis, predict_mu_sigma_p90
 
 # ---------------------------------------------------------------------------
 # Config

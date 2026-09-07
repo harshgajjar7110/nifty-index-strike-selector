@@ -10,7 +10,7 @@ from pathlib import Path
 
 from loguru import logger
 
-BASE_DIR = Path(__file__).parent
+from config import REPO_ROOT as BASE_DIR
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 

@@ -89,7 +89,7 @@ def estimate_ic_premium(
     q: float = cfg.dividend_yield,
 ) -> float:
     """Black-Scholes IC net credit: sell short legs, buy wing legs."""
-    from black_scholes import estimate_ic_premium_bs
+    from utils.black_scholes import estimate_ic_premium_bs
     return estimate_ic_premium_bs(spot, short_put, long_put, short_call, long_call, dte_days, vix_level, r, q)
 
 if __name__ == "__main__":

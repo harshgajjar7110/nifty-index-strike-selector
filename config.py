@@ -12,7 +12,8 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR
 
 
 class _Config(BaseSettings):

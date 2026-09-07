@@ -1,4 +1,4 @@
-"""Regression tests for the strike-placement math contract (AGENTS.md §6).
+"""Regression tests for the strike-placement math contract (AGENTS.md ┬º6).
 
 Locks the contract for:
 - round_to_strike rounding semantics (Python banker's rounding via round())
@@ -15,7 +15,7 @@ import math
 
 import pytest
 
-from module4b_risk import breach_probability
+from spreads.module4b_risk import breach_probability
 from module6_strikes import round_to_strike
 
 
@@ -30,23 +30,23 @@ def test_round_to_strike_multiples_of_50_round_to_self():
 
 
 def test_round_to_strike_above_midpoint_rounds_up():
-    # 23024 (24 < 25) → 23000
+    # 23024 (24 < 25) ΓåÆ 23000
     assert round_to_strike(23024) == 23000
-    # 23026 (26 > 25) → 23050
+    # 23026 (26 > 25) ΓåÆ 23050
     assert round_to_strike(23026) == 23050
 
 
 def test_round_to_strike_below_midpoint_rounds_down():
-    # 23074 (74 < 75) → 23050
+    # 23074 (74 < 75) ΓåÆ 23050
     assert round_to_strike(23074) == 23050
-    # 23076 (76 > 75) → 23100
+    # 23076 (76 > 75) ΓåÆ 23100
     assert round_to_strike(23076) == 23100
 
 
 def test_round_to_strike_python_bankers_rounding_at_half():
     # Python's round() uses banker's rounding (half-to-even).
-    # 23025 / 50 = 0.5 → 0 (even); result = 23000.
-    # 23075 / 50 = 1.5 → 2 (even); result = 23100.
+    # 23025 / 50 = 0.5 ΓåÆ 0 (even); result = 23000.
+    # 23075 / 50 = 1.5 ΓåÆ 2 (even); result = 23100.
     assert round_to_strike(23025) == 23000
     assert round_to_strike(23075) == 23100
 
@@ -108,7 +108,7 @@ def test_breach_prob_call_and_put_equal_for_equidistant_otm_strikes():
     # log_range_needed = log(1 + 2*half_range_needed). For equidistant OTM strikes
     # (offset above and below spot), the half_range_needed magnitudes are equal,
     # so call and put breach probabilities are equal regardless of mu.
-    # This is the actual contract — locked here to prevent silent divergence.
+    # This is the actual contract ΓÇö locked here to prevent silent divergence.
     for mu in (0.0, 0.01, -0.005):
         sigma = 0.02
         spot = 23800
@@ -120,7 +120,7 @@ def test_breach_prob_call_and_put_equal_for_equidistant_otm_strikes():
 
 def test_breach_prob_at_or_inside_spot_returns_one():
     # For a call at K <= spot (half_range_needed <= 0), the function returns
-    # 1.0 — the strike is already breached. Lock the current behavior.
+    # 1.0 ΓÇö the strike is already breached. Lock the current behavior.
     p = breach_probability(strike=23800, mu=0.01, sigma=0.02, spot=23800, side="call")
     assert p == 1.0
     p_itm = breach_probability(strike=23600, mu=0.01, sigma=0.02, spot=23800, side="call")
@@ -141,7 +141,7 @@ def test_breach_prob_invalid_side_raises():
 
 
 # ---------------------------------------------------------------------------
-# generate_credit_spread — wing width floor
+# generate_credit_spread ΓÇö wing width floor
 # ---------------------------------------------------------------------------
 
 
@@ -157,7 +157,7 @@ def _oi_sample():
 def test_generate_credit_spread_wing_width_floor_50():
     # Even with very low DTE (where dte_scalar is small), scaled_wing is
     # bounded below by 50 after rounding.
-    from module9_spreads import generate_credit_spread
+    from spreads.module9_spreads import generate_credit_spread
 
     spread = generate_credit_spread(
         spot=23800, log_range_p10=0.019, log_range_p90=0.039,
@@ -170,7 +170,7 @@ def test_generate_credit_spread_wing_width_floor_50():
 
 
 def test_generate_credit_spread_wing_width_grows_with_dte():
-    from module9_spreads import generate_credit_spread
+    from spreads.module9_spreads import generate_credit_spread
 
     short = generate_credit_spread(
         spot=23800, log_range_p10=0.019, log_range_p90=0.039,
@@ -213,14 +213,15 @@ def test_ev_proxy_identity_holds_for_any_inputs():
 
 
 def test_ev_proxy_negative_when_rr_poor():
-    # R:R of 0.18 (premium 45 / max_loss 254) at POP 73.6% → negative EV.
+    # R:R of 0.18 (premium 45 / max_loss 254) at POP 73.6% ΓåÆ negative EV.
     premium, max_loss, pop = 45.0, 254.0, 0.736
     ev = premium * pop - max_loss * (1 - pop)
     assert ev < 0
 
 
 def test_ev_proxy_positive_when_rr_good():
-    # R:R of 0.33 (premium 50 / max_loss 150) at POP 80% → clearly positive.
+    # R:R of 0.33 (premium 50 / max_loss 150) at POP 80% ΓåÆ clearly positive.
     premium, max_loss, pop = 50.0, 150.0, 0.80
     ev = premium * pop - max_loss * (1 - pop)
     assert ev > 0
+
