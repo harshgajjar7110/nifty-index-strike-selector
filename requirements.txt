@@ -15,6 +15,7 @@ statsmodels>=0.14.0
 lightgbm>=4.3.0
 scikit-learn>=1.4.0
 shap>=0.44.0
+torch>=2.0.0  # module4c LSTM sequence features (CPU build is fine)
 
 # Conformal Prediction (calibrated intervals)
 MAPIE>=0.8.0

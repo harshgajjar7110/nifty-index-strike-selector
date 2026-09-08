@@ -60,7 +60,7 @@ FEATURE_DRIFT_PVAL = cfg.monitor_feature_drift_pval
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_backtest_or_results() -> pd.DataFrame | None:
+def _load_backtest_or_results() -> tuple[pd.DataFrame | None, Path | None]:
     """Load most recent P&L results (walk-forward preferred, fallback to static backtest)."""
     for path in [BACKTEST_PATH, OUTPUTS_DIR / "backtest_results.csv"]:
         if path.exists():
@@ -68,8 +68,8 @@ def _load_backtest_or_results() -> pd.DataFrame | None:
             if "week_end" in df.columns:
                 df["week_end"] = pd.to_datetime(df["week_end"])
                 df = df.set_index("week_end").sort_index()
-            return df
-    return None
+            return df, path
+    return None, None
 
 
 def _load_feature_matrix() -> pd.DataFrame | None:
@@ -124,7 +124,14 @@ def run_monitor() -> dict:
     # ------------------------------------------------------------------
     # 1. Coverage decay analysis
     # ------------------------------------------------------------------
-    results = _load_backtest_or_results()
+    results, results_path = _load_backtest_or_results()
+    if results_path is not None:
+        age_days = (date.today() - date.fromtimestamp(results_path.stat().st_mtime)).days
+        report["results_source"] = {"file": results_path.name, "age_days": age_days}
+        if age_days > 7:
+            report["alerts"].append(
+                f"STALE_RESULTS: {results_path.name} is {age_days}d old — re-run walkforward/backtest"
+            )
     if results is not None and len(results) > 0:
         # Overall coverage
         if "actual_log_range" in results.columns and "log_range_p10" in results.columns:
@@ -137,6 +144,11 @@ def run_monitor() -> dict:
                 report["alerts"].append(
                     f"COVERAGE_DECAY: overall={overall_cov:.2%} vs target={TARGET_COVERAGE:.0%}"
                 )
+
+            # Recency-weighted context: coverage over the most recent 12 trades
+            recent_n = min(12, len(results))
+            recent_cov = float(covered.tail(recent_n).mean())
+            report["coverage_analysis"]["recent_12w_coverage"] = round(recent_cov, 4)
 
             # Rolling coverage
             rolling_cov = _compute_rolling_coverage(results, window=8)
@@ -254,7 +266,10 @@ def run_monitor() -> dict:
     for a in report["alerts"]:
         print(f"    • {a}")
     cov = report.get("coverage_analysis", {})
+    src = report.get("results_source", {})
+    print(f"  Source: {src.get('file', 'N/A')} ({src.get('age_days', '?')}d old)")
     print(f"  Overall coverage: {cov.get('overall_coverage', 'N/A')}")
+    print(f"  Recent 12w cov  : {cov.get('recent_12w_coverage', 'N/A')}")
     print(f"  Recent 8w WR    : {cov.get('recent_8w_win_rate', 'N/A')}")
     print("=" * 60 + "\n")
 
