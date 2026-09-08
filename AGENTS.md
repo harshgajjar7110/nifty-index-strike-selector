@@ -125,28 +125,28 @@ python run_pipeline.py --mode retrain
 
 ```env
 # Strike buffer (points) — scaled by VIX dynamically
-STRIKE_BUFFER_POINTS=100
-MIN_BUFFER_POINTS=100
+STRIKE_BUFFER_POINTS=50
+MIN_BUFFER_POINTS=75
 
 # Wing widths per VIX regime
-WING_WIDTH_LOW_VIX=300
-WING_WIDTH_MID_VIX=400
-WING_WIDTH_HIGH_VIX=500
+WING_WIDTH_LOW_VIX=150
+WING_WIDTH_MID_VIX=200
+WING_WIDTH_HIGH_VIX=250
 
 # Quantile alphas per regime (configurable)
-ALPHA_LOW_P10=0.10
-ALPHA_LOW_P90=0.90
-ALPHA_MID_P10=0.15
-ALPHA_MID_P90=0.85
-ALPHA_HIGH_P10=0.10
-ALPHA_HIGH_P90=0.90
+ALPHA_LOW_P10=0.075
+ALPHA_LOW_P90=0.925
+ALPHA_MID_P10=0.075
+ALPHA_MID_P90=0.925
+ALPHA_HIGH_P10=0.075
+ALPHA_HIGH_P90=0.925
 
 # Walk-forward
 WF_INITIAL_TRAIN_WEEKS=120
 WF_RETRAIN_EVERY_WEEKS=4
-WF_CALIBRATION_WEEKS=40
+WF_CALIBRATION_WEEKS=20
 WF_SL_MULTIPLIER=3.0
-WF_MAX_VIX_TRADE=22
+WF_MAX_VIX_TRADE=30
 WF_MIN_PREMIUM_PTS=20
 
 # Conformal target
@@ -216,7 +216,7 @@ Any change to strike logic **must** preserve this:
    ```
 
 ### Safety / Risk Mitigations
-- **Skip trade** if VIX > `WF_MAX_VIX_TRADE` (22) **or** expected premium < `WF_MIN_PREMIUM_PTS` (20).
+- **Skip trade** if VIX > `WF_MAX_VIX_TRADE` (30) **or** expected premium < `WF_MIN_PREMIUM_PTS` (20).
 - **Position sizing:** max loss = 1–2% of capital per weekly trade.
 - **Worst cases** (gap-down, earnings, geopolitics, liquidity gap, weekend) — see README §"Worst-Case Scenarios".
 
