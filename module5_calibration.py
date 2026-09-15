@@ -90,13 +90,21 @@ def run_calibration() -> dict:
     X = df_clean[available_features].values
     y = df_clean[target_col].values
 
-    split_idx = int(len(X) * 0.80)  # Align with module4_model.py 80/20 split to avoid data leakage
-    X_calib_all = df_clean[available_features].iloc[split_idx:]
-    y_calib_all = df_clean[target_col].iloc[split_idx:]
-    n = len(X_calib_all)
-    X_conf_arr = X_calib_all.values
-    y_conf_arr = y_calib_all.values
-    logger.info(f"Calibration set size: {n} samples (global-only, no per-regime split)")
+    split_idx = int(len(X) * 0.80)  # Align with module4_model.py 80/20 split
+    X_holdout = df_clean[available_features].iloc[split_idx:]
+    y_holdout = df_clean[target_col].iloc[split_idx:]
+    n_holdout = len(X_holdout)
+
+    # Split holdout into conformalize (70%) and evaluation (30%) — disjoint sets
+    # Conformalize on older holdout data, evaluate on newer holdout data
+    conf_split_idx = int(n_holdout * 0.70)
+    X_conf_arr = X_holdout.iloc[:conf_split_idx].values
+    y_conf_arr = y_holdout.iloc[:conf_split_idx].values
+    X_eval_arr = X_holdout.iloc[conf_split_idx:].values
+    y_eval_arr = y_holdout.iloc[conf_split_idx:].values
+    n_conf = len(X_conf_arr)
+    n_eval = len(X_eval_arr)
+    logger.info(f"Conformalization set: {n_conf} samples | Evaluation set: {n_eval} samples (disjoint)")
 
     low_thresh, high_thresh = _load_regime_thresholds()
     logger.info(f"Loaded regime thresholds: low={low_thresh}, high={high_thresh}")
@@ -115,11 +123,9 @@ def run_calibration() -> dict:
         prefit=True,
     )
     mapie_global.conformalize(X_conf_arr, y_conf_arr)
-    logger.info(f"Global MAPIE conformalized on {n} samples")
+    logger.info(f"Global MAPIE conformalized on {n_conf} samples")
 
     vix_col_idx = feature_columns.index("vix_level")
-    X_eval_arr = X_conf_arr
-    y_eval_arr = y_conf_arr
     coverage_per_regime = {}
     calibration_method = {}
     for regime in REGIMES:
@@ -137,10 +143,10 @@ def run_calibration() -> dict:
             else:
                 y_low_r, y_high_r = y_pis_r[:, 0], y_pis_r[:, 1]
             coverage_per_regime[regime] = float(np.mean((y_low_r <= y_r_eval) & (y_r_eval <= y_high_r)))
-            logger.info(f"Regime {regime} in-sample coverage: {coverage_per_regime[regime]:.4f} (n={len(X_r_eval)})")
+            logger.info(f"Regime {regime} OOS coverage: {coverage_per_regime[regime]:.4f} (n={len(X_r_eval)})")
         else:
             coverage_per_regime[regime] = None
-        calibration_method[regime] = "global_only"
+        calibration_method[regime] = "global_only_eval_on_holdout"
 
     for regime in REGIMES:
         stale_path = MODELS_DIR / f"mapie_{regime}.pkl"
@@ -151,48 +157,18 @@ def run_calibration() -> dict:
     joblib.dump(mapie_global, MODELS_DIR / "mapie_calibrated.pkl")
     logger.info("Saved global MAPIE to mapie_calibrated.pkl")
 
-    # Compute coverage: Use the evaluation set (X_eval_arr) which was NOT used for conformalization
-    def compute_coverage_mapie() -> dict:
-        """Honest OOS coverage via 3-fold TimeSeriesSplit over the holdout."""
-        from sklearn.model_selection import TimeSeriesSplit
-        tscv = TimeSeriesSplit(n_splits=3)
-        covered_all, low_all, high_all, y_all = [], [], [], []
-        for tr_idx, te_idx in tscv.split(X_conf_arr):
-            m = SplitConformalRegressor(estimator=wrapper_global, confidence_level=target_coverage, prefit=True)
-            m.conformalize(X_conf_arr[tr_idx], y_conf_arr[tr_idx])
-            _, y_pis_cv = m.predict_interval(X_conf_arr[te_idx])
-            if len(y_pis_cv.shape) == 3:
-                low_cv, high_cv = y_pis_cv[:, 0, 0], y_pis_cv[:, 1, 0]
-            else:
-                low_cv, high_cv = y_pis_cv[:, 0], y_pis_cv[:, 1]
-            y_te = y_conf_arr[te_idx]
-            covered_all.append((low_cv <= y_te) & (y_te <= high_cv))
-            low_all.append(low_cv)
-            high_all.append(high_cv)
-            y_all.append(y_te)
-        covered = np.concatenate(covered_all)
-        y_low = np.concatenate(low_all)
-        y_high = np.concatenate(high_all)
-        y_eval_cv = np.concatenate(y_all)
-        actual_coverage = float(np.mean(covered))
-        half_width = (y_high - y_low) / 2
-        mid = (y_low + y_high) / 2
-
-        return {
-            "actual_coverage": float(actual_coverage),
-            "_mid": mid,
-            "_half_width": half_width,
-            "_y_test": y_eval_cv,
-        }
-
-    coverage_results = compute_coverage_mapie()
-    actual_coverage = coverage_results["actual_coverage"]
-    _mid = coverage_results.pop("_mid")
-    _half_width = coverage_results.pop("_half_width")
-    _y_test = coverage_results.pop("_y_test")
+    # Compute coverage on the evaluation set using the fitted conformalizer
+    logger.info(f"Computing OOS coverage on evaluation set of {n_eval} samples")
+    _, y_pis_eval = mapie_global.predict_interval(X_eval_arr)
+    if len(y_pis_eval.shape) == 3:
+        y_low_eval, y_high_eval = y_pis_eval[:, 0, 0], y_pis_eval[:, 1, 0]
+    else:
+        y_low_eval, y_high_eval = y_pis_eval[:, 0], y_pis_eval[:, 1]
+    actual_coverage = float(np.mean((y_low_eval <= y_eval_arr) & (y_eval_arr <= y_high_eval)))
+    half_width = (y_high_eval - y_low_eval) / 2
+    mid = (y_low_eval + y_high_eval) / 2
 
     logger.info(f"Empirical OOS coverage @ {target_coverage:.0%}: {actual_coverage:.4f}")
-
     if actual_coverage < target_coverage:
         logger.warning(f"Coverage {actual_coverage:.4f} is below target {target_coverage:.2f}")
 
@@ -225,7 +201,7 @@ def run_calibration() -> dict:
             label="Perfect calibration", linewidth=1.5)
     ax.set_xlabel("Nominal Coverage", fontsize=12)
     ax.set_ylabel("Empirical Coverage", fontsize=12)
-    ax.set_title("MAPIE Conformal Calibration Curve\n(Nifty 50 Weekly Log-Range)", fontsize=13)
+    ax.set_title("MAPIE Conformal Calibration Curve\\n(Nifty 50 Weekly Log-Range)", fontsize=13)
     ax.legend(fontsize=11)
     ax.set_xlim(0.68, 0.97)
     ax.set_ylim(0.68, 0.97)

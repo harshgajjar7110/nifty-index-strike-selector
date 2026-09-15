@@ -91,31 +91,41 @@ def test_breach_prob_put_decreases_as_strike_moves_otm():
     assert p_close > p_mid > p_far
 
 
-def test_breach_prob_call_and_put_equal_when_mu_zero():
-    # When mu=0 (symmetric log-range distribution), call and put breach
-    # probabilities are equal at equidistant strikes from spot.
+def test_breach_prob_call_and_put_approx_equal_when_mu_zero():
+    # When mu=0, call and put breach probabilities are approximately
+    # equal at equidistant strikes (log-return asymmetry makes them
+    # close but not identical).
     mu, sigma = 0.0, 0.02
     spot = 23800
     offset = 300
     p_call = breach_probability(spot + offset, mu, sigma, spot, "call")
     p_put  = breach_probability(spot - offset, mu, sigma, spot, "put")
-    assert math.isclose(p_call, p_put, rel_tol=1e-9, abs_tol=1e-12)
+    assert math.isclose(p_call, p_put, rel_tol=0.01, abs_tol=1e-2)
 
 
-def test_breach_prob_call_and_put_equal_for_equidistant_otm_strikes():
-    # NOTE: breach_probability in module4b_risk uses the same Normal(mu, sigma)
-    # distribution for both call and put sides via the half-range parameterisation
-    # log_range_needed = log(1 + 2*half_range_needed). For equidistant OTM strikes
-    # (offset above and below spot), the half_range_needed magnitudes are equal,
-    # so call and put breach probabilities are equal regardless of mu.
-    # This is the actual contract ΓÇö locked here to prevent silent divergence.
-    for mu in (0.0, 0.01, -0.005):
+def test_breach_prob_call_and_put_differ_when_mu_nonzero():
+    # With the corrected log-return parameterization, call and put breach
+    # probabilities are NOT equal when mu != 0 (the distribution is not
+    # symmetric around spot in log-space).
+    for mu in (0.01, -0.005):
         sigma = 0.02
         spot = 23800
         offset = 300
         p_call = breach_probability(spot + offset, mu, sigma, spot, "call")
         p_put  = breach_probability(spot - offset, mu, sigma, spot, "put")
-        assert math.isclose(p_call, p_put, rel_tol=1e-9, abs_tol=1e-12)
+        # They should be different when mu != 0
+        assert not math.isclose(p_call, p_put, rel_tol=1e-9, abs_tol=1e-12)
+
+
+def test_breach_prob_call_and_put_symmetric_when_mu_zero():
+    # When mu=0, equidistant OTM strikes have approximately equal
+    # breach probabilities by near-symmetry of the Normal distribution.
+    sigma = 0.02
+    spot = 23800
+    offset = 300
+    p_call = breach_probability(spot + offset, 0.0, sigma, spot, "call")
+    p_put  = breach_probability(spot - offset, 0.0, sigma, spot, "put")
+    assert math.isclose(p_call, p_put, rel_tol=0.01, abs_tol=1e-2)
 
 
 def test_breach_prob_at_or_inside_spot_returns_one():

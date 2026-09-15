@@ -70,7 +70,7 @@ def mode_setup():
     """
     Full first-time setup:
     M1 → M2 → M3 → M4 → M5
-    Fetches 5yr data, engineers features, fits GARCH, trains models, calibrates.
+    Fetches ~16yr data (845 weeks), engineers features, fits GARCH, trains models, calibrates.
     """
     print("\n" + "═"*60)
     print("  SETUP MODE  —  First-time full pipeline")
@@ -123,18 +123,18 @@ def mode_setup():
 
 def mode_backtest():
     """
-    Walk-forward backtest of IC strategy over test set.
+    Static 80/20 backtest of IC strategy over the test set.
     Requires setup mode to have been run first.
     """
     print("\n" + "═"*60)
-    print("  BACKTEST MODE  —  Walk-forward P&L simulation")
+    print("  BACKTEST MODE  —  Static 80/20 P&L simulation")
     print("═"*60 + "\n")
 
     if not _models_exist():
         print("[ERROR] Models not found. Run --mode setup first.\n")
         sys.exit(1)
 
-    _step("M7 — Running walk-forward backtest")
+    _step("M7 — Running static 80/20 backtest")
     from module7_backtest import run_backtest
     summary = run_backtest()
 
@@ -171,7 +171,7 @@ def mode_live():
     strikes = run_live_pipeline()
 
     if strikes:
-        print(f"\n  Strikes saved → outputs/strikes_live.json\n")
+        print(f"\n  Spreads saved → outputs/spreads_live.json\n")
 
 
 def mode_walkforward():
@@ -277,6 +277,11 @@ def mode_retrain():
     cal_report = run_calibration()
     target_cov = cal_report.get('target_coverage', 0.85)
     logger.success(f"M5 done — Coverage @{target_cov:.0%}: {cal_report.get('actual_oos_coverage', '?')}")
+
+    # Auto-run monitor to check drift and coverage decay
+    _step("M13 — Auto-running monitor for drift/coverage check")
+    from module13_monitor import run_monitor
+    run_monitor()
 
     # Invalidate model cache so live mode picks up fresh models
     _step("Clearing model cache")

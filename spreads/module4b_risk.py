@@ -4,22 +4,37 @@ import numpy as np
 from scipy.stats import norm as sp_norm
 
 
-def breach_probability(strike: float, mu: float, sigma: float, spot: float, side: str) -> float:
+def _default_rq(r: float | None, q: float | None) -> tuple[float, float]:
+    from config import cfg
+    return (cfg.risk_free_rate if r is None else r, cfg.dividend_yield if q is None else q)
 
-    """Compute P(Nifty breaches strike) given log_range ~ Normal(mu, sigma)."""
+
+def breach_probability(strike: float, mu: float, sigma: float, spot: float, side: str) -> float:
+    """Compute P(log-range breaches strike) under Normal(mu, sigma) assumption.
+    
+    Uses standard log-return parameterization:
+    - P(call breach) = 1 - Φ((ln(short_call/spot) - mu) / sigma)
+    - P(put breach)  = Φ((ln(short_put/spot) - mu) / sigma)
+    """
+    if sigma <= 0:
+        sigma = 1e-9
+    
     if side == "call":
-        half_range_needed = (strike - spot) / spot
-        if half_range_needed <= 0:
+        if strike <= spot:
             return 1.0
+        log_k_over_s = np.log(strike / spot)
+        z = (log_k_over_s - mu) / sigma
+        return float(1.0 - sp_norm.cdf(z))
+    
     elif side == "put":
-        half_range_needed = (spot - strike) / spot
-        if half_range_needed <= 0:
+        if strike >= spot:
             return 1.0
+        log_k_over_s = np.log(strike / spot)
+        z = (log_k_over_s - mu) / sigma
+        return float(sp_norm.cdf(z))
+    
     else:
         raise ValueError(f"side must be 'call' or 'put', got {side}")
-
-    log_range_needed = np.log(1.0 + 2.0 * half_range_needed)
-    return 1.0 - sp_norm.cdf(log_range_needed, loc=mu, scale=sigma)
 
 
 def pop_from_chain_iv(
@@ -27,8 +42,8 @@ def pop_from_chain_iv(
     spot: float,
     dte_days: int,
     iv: float,
-    r: float = 0.065,
-    q: float = 0.015,
+    r: float | None = None,
+    q: float | None = None,
     side: str = "put",
 ) -> float:
     """P(option expires OTM) using per-strike chain IV and Black-Scholes d2.
@@ -37,6 +52,7 @@ def pop_from_chain_iv(
     Short put profits when S_T > K  → POP = N(d2).
     Short call profits when S_T < K → POP = N(-d2).
     """
+    r, q = _default_rq(r, q)
     if iv <= 0 or dte_days <= 0:
         return 0.5
 

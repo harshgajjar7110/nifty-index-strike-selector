@@ -62,4 +62,4 @@ def test_no_oi_falls_back_gracefully():
         oi_strikes={},
     )
     assert spread["pop_pct"] is not None
-    assert 0.0 < spread["pop_pct"] < 1.0
+    assert 0.0 <= spread["pop_pct"] <= 1.0

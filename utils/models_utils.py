@@ -43,6 +43,12 @@ def compute_breach_probability(
 ) -> dict:
     """Compute Gaussian breach probabilities and POP from quantile predictions.
 
+    DEPRECATED: kept for backward compatibility only; numerics unchanged.
+    Canonical breach math is ``spreads.module4b_risk.breach_probability``
+    with sigma = (p90 - p10) / (ppf(a90) - ppf(a10)) from per-regime
+    cfg alphas and ``ln(K/spot)`` strikes (see AGENTS.md Section 6).
+    New code must use ``module4b_risk.breach_probability`` directly.
+
     Uses the log-range Normal assumption:
         mu = (p10 + p90) / 2
         sigma = (p90 - p10) / (2 * z_alpha_p90)

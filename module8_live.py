@@ -52,7 +52,8 @@ def _print_spreads(spreads_result: dict, week_date: str) -> None:
     print(thin)
 
     if not spreads:
-        print("  No feasible spreads found (all below min R:R or OI threshold).")
+        reason = spreads_result.get("no_trade_reason", "all spreads below filters")
+        print(f"  No feasible spreads found: {reason}")
         print(sep)
         return
 
@@ -208,6 +209,11 @@ def run_live_pipeline() -> dict:
             oi_data=oi_data,
         )
 
+        if not spreads_result.get("spreads"):
+            logger.warning(
+                f"No viable trade this week: {spreads_result.get('no_trade_reason', 'all spreads filtered')}"
+            )
+
         # Step 6.5 — Capital-aware sizing (module12, optional)
         # ------------------------------------------------------------------
         try:
@@ -226,7 +232,49 @@ def run_live_pipeline() -> dict:
                     lot_size=cfg.nifty_lot_size,
                     capital_config=cap_cfg,
                 )
+                # Advisory only: capital_sizing is kept separate and MUST NOT
+                # mutate top-level strikes/premium/rr/pop — those stay
+                # consistent with the module9 pricing that also produced
+                # ev_proxy, breakeven, net_premium and breach_prob_per_leg.
                 spread["capital_sizing"] = sizing
+                if sizing.get("status") == "infeasible":
+                    spread["capital_sizing_infeasible"] = True
+                    logger.warning(f"Capital sizing infeasible for {spread['spread_type']} {spread['short_strike']}/{spread['long_strike']}: {sizing.get('infeasibility_reason')}")
+                elif sizing.get("short_strike") is not None:
+                    logger.debug(
+                        f"Capital sizing advisory for {spread['spread_type']} "
+                        f"{spread['short_strike']}/{spread['long_strike']}: safest viable "
+                        f"{sizing['short_strike']}/{sizing['long_strike']} "
+                        f"(kept separate; top-level strikes unchanged)"
+                    )
+
+            # Portfolio budget: split risk capital across ranked spreads,
+            # applying per-spread size_mult (neutral/blend) + soft-VIX band.
+            try:
+                spreads = spreads_result.get("spreads", [])
+                budget = cap_cfg["capital_inr"] * cap_cfg["capital_at_risk_pct"]
+                vix_lv = spreads_result.get("vix_level", vix_level or 16.0)
+                soft_mult = cfg.wf_soft_size_mult if cfg.wf_soft_vix_lower <= vix_lv <= cfg.wf_max_vix_trade else 1.0
+                total_margin = sum(
+                    s.get("capital_sizing", {}).get("capital_summary", {}).get("total_margin_inr", 0) or 0
+                    for s in spreads
+                )
+                scale = min(1.0, budget / total_margin) if total_margin > budget > 0 else 1.0
+                for s in spreads:
+                    cs = s.get("capital_sizing", {})
+                    summ = cs.get("capital_summary", {})
+                    base_lots = summ.get("lots", 0) or 0
+                    eff = max(int(base_lots * s.get("size_mult", 1.0) * soft_mult * scale), 0)
+                    summ["effective_lots"] = eff
+                    summ["portfolio_scale"] = round(scale, 3)
+                    summ["applied_size_mult"] = round(s.get("size_mult", 1.0) * soft_mult, 3)
+                spreads_result["portfolio"] = {
+                    "budget_inr": round(budget, 2),
+                    "total_margin_inr": round(total_margin, 2),
+                    "portfolio_scale": round(scale, 3),
+                }
+            except Exception as e_port:
+                logger.warning(f"Portfolio scaling failed (non-fatal): {e_port}")
 
             logger.info("Capital sizing applied to all spreads")
 

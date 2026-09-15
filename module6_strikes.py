@@ -313,8 +313,9 @@ def generate_strikes(
     range_pts_p10 = current_close * (np.exp(log_range_p10) - 1)
     range_pts_p90 = current_close * (np.exp(log_range_p90) - 1)
     
-    # Use a blended range: 70% P90 + 30% P10 for a robust 'half-range'
-    blended_half_range = (0.70 * range_pts_p90 + 0.30 * range_pts_p10) / 2.0
+    # Use a blended range: P90_BLEND_WEIGHT on P90 + remainder on P10 for a robust 'half-range'
+    w_p90 = cfg.p90_blend_weight
+    blended_half_range = (w_p90 * range_pts_p90 + (1.0 - w_p90) * range_pts_p10) / 2.0
 
     lower_price = current_close - blended_half_range - effective_buffer - put_skew_pts
     upper_price = current_close + blended_half_range + effective_buffer + call_skew_pts
@@ -322,11 +323,11 @@ def generate_strikes(
     short_put = round_to_strike(lower_price)
     short_call = round_to_strike(upper_price)
 
-    # Blend strikes 30% toward max pain
+    # Blend strikes toward max pain
     if max_pain is not None:
-        _MP_BLEND = 0.30
-        short_put  = short_put  + _MP_BLEND * (max_pain - short_put)
-        short_call = short_call + _MP_BLEND * (max_pain - short_call)
+        mp_blend = cfg.mp_blend
+        short_put  = short_put  + mp_blend * (max_pain - short_put)
+        short_call = short_call + mp_blend * (max_pain - short_call)
         short_put  = round_to_strike(short_put)
         short_call = round_to_strike(short_call)
         logger.info(f"Max pain blend applied: max_pain={max_pain}, short_put->{short_put}, short_call->{short_call}")
@@ -432,6 +433,8 @@ def run_live_prediction(feature_row: pd.Series) -> dict:
         log_range_p10=range_pred["log_range_p10"],
         log_range_p90=range_pred["log_range_p90"],
         vix_level=vix_level,
+        log_range_mu=range_pred.get("log_range_mu"),
+        log_range_sigma=range_pred.get("log_range_sigma"),
     )
 
     out_path = OUTPUTS_DIR / f"strikes_{date.today().isoformat()}.json"

@@ -25,7 +25,7 @@ def calculate_nse_charges(
     num_legs : int
         Number of legs (4 for Iron Condor, 2 for Credit Spread).
     lot_size : int
-        Nifty lot size (default 25).
+        Nifty lot size (default cfg.nifty_lot_size).
     is_sell : bool
         Whether this is the entry (sell) or exit (buy/expiry).
     """

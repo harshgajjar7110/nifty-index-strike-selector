@@ -6,7 +6,7 @@ __all__ = [
     "extract_pis", "compute_breach_probability", "predict_mu_sigma_p90",
     "soft_vix_size_multiplier", "REGIMES", "load_regime_thresholds",
     "assign_regime", "assign_regime_series", "extract_vix", "find_column",
-    "chronological_train_test_split",
+    "chronological_train_test_split", "refit_garch_per_quarter",
 ]
 
 _LAZY = {
@@ -28,6 +28,7 @@ _LAZY = {
     "extract_vix": "utils.utils_constants",
     "find_column": "utils.utils_constants",
     "chronological_train_test_split": "utils.utils_constants",
+    "refit_garch_per_quarter": "utils.garch_utils",
 }
 
 

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Universal dev guidance for AI coding assistants (Claude Code, Gemini CLI, Cursor, Copilot, Kilo, etc.) working in this repo. Consolidates and supersedes `CLAUDE.md` and `GEMINI.md`.
+Universal dev guidance for AI coding assistants working in this repo.
 
 ---
 
@@ -17,7 +17,7 @@ Universal dev guidance for AI coding assistants (Claude Code, Gemini CLI, Cursor
 ## 2. Quick Commands
 
 ```bash
-# First-time setup (downloads ~5yr data, engineers features, fits GARCH,
+# First-time setup (downloads ~16yr data — 845 weeks, engineers features, fits GARCH,
 # trains per-regime LightGBM P10/P90, applies MAPIE calibration) — ~10–30 min
 python run_pipeline.py --mode setup
 
@@ -103,7 +103,7 @@ python run_pipeline.py --mode retrain
 | M6     | M4/M5 models, live spot + VIX               | `outputs/strikes_YYYY-MM-DD.json`                                      | Iron condor strikes                  |
 | M7     | M3/M4/M6                                   | `outputs/backtest_results.csv`, `backtest_equity_curve.png`, `backtest_summary.json` | Static backtest P&L                  |
 | M7b    | M3/M4/M6, retrain loop                      | `outputs/walkforward_*.csv/png/json`                                   | Walk-forward backtest                |
-| M8     | M1, M2, M3, M5, M6 (incremental)            | `outputs/strikes_live.json`, console log                               | Sunday-night live strikes            |
+| M8     | M1, M2, M3, M5, M6 (incremental)            | `outputs/spreads_live.json`, console log                               | Sunday-night live spreads            |
 | M13    | M5 calibration + backtest outputs          | `outputs/monitor_report_YYYY-MM-DD.json`                               | Drift / coverage decay detection     |
 
 ---
@@ -206,14 +206,16 @@ Any change to strike logic **must** preserve this:
    long_put   = short_put  - wing_width
    long_call  = short_call + wing_width
    ```
-5. **Breach Probability (Gaussian on log-range):**
+   Strikes use Python banker's `round()` via `round_to_strike` (half-to-even on exact .5).
+5. **Breach Probability (Gaussian on log-range, canonical):**
    ```
    mu    = (p10 + p90) / 2
-   sigma = (p90 - p10) / (2 * z_0.90)
+   sigma = (p90 - p10) / (ppf(a90) - ppf(a10))   [per-regime cfg alphas]
    breach_prob_call = 1 - Φ((ln(short_call/spot) - mu) / sigma)
    breach_prob_put  =     Φ((ln(short_put/spot)  - mu) / sigma)
    POP             = 1 - breach_call - breach_put
    ```
+   Canonical implementation: `spreads.module4b_risk.breach_probability`; `utils.models_utils.compute_breach_probability` is deprecated (numerics frozen).
 
 ### Safety / Risk Mitigations
 - **Skip trade** if VIX > `WF_MAX_VIX_TRADE` (30) **or** expected premium < `WF_MIN_PREMIUM_PTS` (20).
@@ -326,7 +328,7 @@ python run_pipeline.py --mode setup
 
 ### Live Deployment
 - Run `module8_live.py` (or `run_pipeline.py --mode live`) every Sunday via cron / Task Scheduler.
-- Output: `outputs/strikes_live.json` — parse + execute via broker API (Kite).
+- Output: `outputs/spreads_live.json` — parse + execute via broker API (Kite).
 - Track `outputs/backtest_equity_curve.png` weekly — Sharpe degradation ⇒ retrain.
 
 ### Maintenance Cadence
@@ -353,6 +355,11 @@ When making changes in this repo, AI assistants **must**:
 11. **Be concise** — no prose explanations in code, no emojis, no unnecessary comments.
 12. **Respect safety guards:** `WF_MAX_VIX_TRADE` and `WF_MIN_PREMIUM_PTS` are hard skip conditions — do not bypass them.
 13. **Don't introduce new top-level dependencies** without explicit ask; check `requirements.txt` first.
+
+### Selection Protocol (3-way split)
+- Chronological split: train 0-60% / selection 60-80% / test 80-100%.
+- All hyperparameter/config sweeps select on the selection set only, never on test.
+- Tuning logs must record the selection-set metric used for each decision.
 
 ### What to Avoid (Antipatterns)
 - Mixing train/test data across time boundaries.

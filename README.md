@@ -5,7 +5,7 @@ ML-powered system for **conservative strike placement** in weekly iron condor op
 ## Quick Start
 
 ```bash
-# First-time setup (downloads 5yr data, engineers features, trains models, calibrates)
+# First-time setup (downloads ~16yr data — 845 weeks, engineers features, trains models, calibrates)
 python run_pipeline.py --mode setup
 
 # Static backtest (80/20 train/test split)
@@ -41,7 +41,7 @@ python run_pipeline.py --mode monitor
 
 ```
 Data Pipeline (M1)
-    ↓ (5yr daily OHLCV, intraday, India VIX)
+    ↓ (~16yr daily OHLCV — 845 weeks, intraday, India VIX)
 Feature Engineering (M2)
     ↓ (ATR, volatility, Bollinger Bands, range, macro features)
 GARCH Volatility (M3)
@@ -64,7 +64,6 @@ Model Drift Monitor (M13)
 | Module | Purpose |
 |--------|---------|
 | `module1b_macro.py` | Fetch US VIX, SPX, crude, USD/INR, US 10Y from Yahoo Finance; build weekly macro features |
-| `module4c_lstm_seq.py` | LSTM (90-day sequences) quantile features — `lstm_p10/p90/spread` inputs to LightGBM |
 | `module7b_walkforward.py` | Expanding-window walk-forward backtest with periodic retrain every 4 weeks |
 | `module13_monitor.py` | Coverage decay detection, rolling win-rate alerts, KS feature drift tests, results-file staleness check |
 | `config.py` | Pydantic `BaseSettings` with range validation and convenience properties |
@@ -114,7 +113,7 @@ MONITOR_FEATURE_DRIFT_PVAL=0.01
 
 ```bash
 python run_pipeline.py --mode live
-# Output: strikes_live.json with short put, short call, long put, long call
+# Output: spreads_live.json (canonical) with credit-spread picks
 ```
 
 ### Backtesting
@@ -185,26 +184,28 @@ Outputs `outputs/monitor_report_YYYY-MM-DD.json` with `RETRAIN` / `REVIEW_FEATUR
    range_pts_p90 = spot * (exp(log_range_p90) - 1)
    blended_half_range = (0.70 * range_pts_p90 + 0.30 * range_pts_p10) / 2.0
 
-   short_put  = round_to_50(spot - blended_half_range - effective_buffer - put_skew)
-   short_call = round_to_50(spot + blended_half_range + effective_buffer + call_skew)
-   long_put   = short_put - wing_width
-   long_call  = short_call + wing_width
-   ```
+    short_put  = round_to_50(spot - blended_half_range - effective_buffer - put_skew)
+    short_call = round_to_50(spot + blended_half_range + effective_buffer + call_skew)
+    long_put   = short_put - wing_width
+    long_call  = short_call + wing_width
+    ```
+    Strikes use Python banker's `round()` via `round_to_strike` (half-to-even on exact .5).
 
-5. **Breach Probability:**
-   ```
-   log_range_mu    = (p10 + p90) / 2
-   log_range_sigma = (p90 - p10) / (2 * z_0.90)
-   breach_prob_call = 1 - Φ((ln(short_call/spot) - mu) / sigma)
-   breach_prob_put  = Φ((ln(short_put/spot) - mu) / sigma)
-   POP = 1 - breach_call - breach_put
-   ```
+5. **Breach Probability (canonical — Gaussian on log-range):**
+    ```
+    log_range_mu    = (p10 + p90) / 2
+    log_range_sigma = (p90 - p10) / (ppf(a90) - ppf(a10))   [per-regime cfg alphas]
+    breach_prob_call = 1 - Φ((ln(short_call/spot) - mu) / sigma)
+    breach_prob_put  = Φ((ln(short_put/spot) - mu) / sigma)
+    POP = 1 - breach_call - breach_put
+    ```
+    Canonical: `spreads.module4b_risk.breach_probability`; `utils.models_utils.compute_breach_probability` is deprecated (numerics frozen).
 
 ## Data Files
 
 | Path | Format | Purpose |
 |------|--------|---------|
-| `data/nifty_daily.parquet` | OHLCV | 5yr daily bars (yfinance) |
+| `data/nifty_daily.parquet` | OHLCV | ~16yr daily bars — 845 weeks (yfinance) |
 | `data/nifty_weekly.parquet` | OHLCV | Weekly aggregation |
 | `data/india_vix_daily.parquet` | close | India VIX history |
 | `data/nifty_intraday.parquet` | OHLCV | 1h bars (~730 days) |
@@ -214,7 +215,7 @@ Outputs `outputs/monitor_report_YYYY-MM-DD.json` with `RETRAIN` / `REVIEW_FEATUR
 | `models/lgb_low.pkl` | serialized | LightGBM quantile models (VIX < low_thresh) |
 | `models/lgb_mid.pkl` | serialized | LightGBM quantile models (mid regime) |
 | `models/lgb_high.pkl` | serialized | LightGBM quantile models (VIX ≥ high_thresh) |
-| `models/mapie_calibrated.pkl` | serialized | Global MAPIE conformal calibrator (global-only; per-regime splits removed — conf sets starved below n=7) |
+| `models/mapie_calibrated.pkl` | serialized | Global MAPIE conformal calibrator with honest evaluation: conformalize on 70% of 20% holdout, evaluate on remaining 30% (disjoint sets). Per-regime coverage reports OOS coverage, not in-sample. |
 | `models/garch_model.pkl` | serialized | Fitted GJR-GARCH model |
 | `models/regime_model_meta.json` | metadata | Model sources & training sizes |
 | `models/feature_columns.pkl` | list | Feature names (training order) |
@@ -268,7 +269,7 @@ python run_pipeline.py --mode walkforward
 | Max drawdown | 341 pts | 276 pts |
 | Expectancy/trade | 8.1 pts | 13.0 pts |
 
-> **Note:** Measured 2026-09-08 on the SEQ90 stack (16yr history 2010–2026, LSTM 90-day quantile features, per-regime LightGBM 0.075/0.925, global-only MAPIE). Walk-forward is the realistic benchmark (expanding window + 20-week MAPIE recalibration, 201 trades). Static interval coverage is 85.8% (145/169, target met); M5 OOS is 80.2%. Static high-VIX breach reads 25% but on n=16 test weeks — walk-forward high-VIX breach is 11.0% and governs. Monitor still flags `RETRAIN` on the WF series (76.8%) while recent 8w win rate is 100% — thresholds are conservative by design.
+> **Note:** Measured 2026-09-08 on the per-regime LightGBM 0.075/0.925 stack with global-only MAPIE. Walk-forward is the realistic benchmark (expanding window + 20-week MAPIE recalibration, 201 trades). Static interval coverage is 85.8% (145/169, target met); M5 OOS is 80.2%. Static high-VIX breach reads 25% but on n=16 test weeks — walk-forward high-VIX breach is 11.0% and governs. Monitor still flags `RETRAIN` on the WF series (76.8%) while recent 8w win rate is 100% — thresholds are conservative by design.
 
 ### Tuning Guide
 
@@ -278,6 +279,10 @@ If coverage < 80% in monitor → retrain models or increase buffer
 If breach_rate_high_vix > 20% → lower WF_MAX_VIX_TRADE or widen wing width
 If premium < 20 pts consistently → reduce buffer or tighten wing width
 ```
+
+### Selection Protocol
+
+Chronological 3-way split: train 0-60% / selection 60-80% / test 80-100%. All hyperparameter and config sweeps select on the selection set only, never on test. Tuning logs must record the selection-set metric used for selection.
 
 ## Worst-Case Scenarios
 
@@ -329,4 +334,4 @@ Built for conservative options traders targeting weekly theta decay + VIX-aware 
 
 ---
 
-**Questions?** Check `CLAUDE.md` for development notes or module docstrings for API details.
+**Questions?** Check module docstrings for API details.

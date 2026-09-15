@@ -16,6 +16,7 @@ from loguru import logger
 
 from config import cfg
 from utils.utils_constants import REGIMES, load_regime_thresholds, extract_vix, assign_regime_series
+from utils.garch_utils import refit_garch_per_quarter as _refit_garch_per_quarter
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -26,7 +27,6 @@ WEEKLY_PATH = BASE_DIR / "data" / "nifty_weekly.parquet"
 OUTPUTS_DIR = BASE_DIR / "outputs"
 
 LOT_SIZE = cfg.nifty_lot_size
-SKEW_PTS_PER_PERCENT_IMBALANCE = 25  # empirical: 1% breach diff → 25 pts skew
 
 # ---------------------------------------------------------------------------
 # Module 6 import via sys.path
@@ -64,82 +64,8 @@ def _max_drawdown(cumulative_pnl: np.ndarray) -> float:
 
 
 
-def _refit_garch_per_quarter(test_df: pd.DataFrame, cache: dict) -> dict:
-    """Refit GARCH per calendar quarter on data ≤ current quarter end, no lookahead.
-
-    Returns a dict keyed by ``week_end`` Timestamp → refit ``garch_sigma_mean`` for
-    that week. The fit is cached per quarter so we only fit ~N_quarters models.
-    The function silently returns an empty dict if the daily data file is missing.
-    """
-    daily_path = BASE_DIR / "data" / "nifty_daily.parquet"
-    if not daily_path.exists():
-        logger.warning("nifty_daily.parquet missing — skipping per-quarter GARCH refit")
-        return {}
-    try:
-        from arch import arch_model
-    except ImportError:
-        logger.warning("arch package unavailable — skipping per-quarter GARCH refit")
-        return {}
-
-    try:
-        daily = pd.read_parquet(daily_path)
-        daily = daily.sort_index()
-        close_col = None
-        for col in ("close", "Close", "CLOSE", "adj_close", "Adj Close"):
-            if col in daily.columns:
-                close_col = col
-                break
-        if close_col is None and len(daily.columns) > 0:
-            close_col = daily.columns[0]
-        if close_col is None:
-            return {}
-
-        closes = daily[close_col]
-        if hasattr(closes.index, "normalize"):
-            closes.index = closes.index.normalize()
-    except Exception as e:
-        logger.warning(f"Per-quarter GARCH: failed to load daily data ({e})")
-        return {}
-
-    overrides: dict = {}
-    quarter_starts = pd.to_datetime(test_df.index).to_period("Q").unique()
-    for q in quarter_starts:
-        if q in cache:
-            quarter_sigma = cache[q]
-        else:
-            q_start = max(q.start_time, closes.index.min())
-            q_end = q.end_time
-            hist = closes.loc[closes.index <= q_end]
-            if len(hist) < 60:
-                cache[q] = None
-                continue
-            returns = np.log(hist / hist.shift(1)).dropna() * 100
-            if len(returns) < 60:
-                cache[q] = None
-                continue
-            try:
-                model = arch_model(returns, vol="Garch", p=1, o=1, q=1, dist="skewt")
-                res = model.fit(disp="off")
-                cond_vol = res.conditional_volatility / 100
-                weekly_mean = cond_vol.resample("W-TUE").mean()
-                quarter_sigma = weekly_mean.to_dict()
-            except Exception as e:
-                logger.warning(f"Per-quarter GARCH fit failed for {q}: {e}")
-                quarter_sigma = None
-            cache[q] = quarter_sigma
-        if not quarter_sigma:
-            continue
-        for week_end, sigma in quarter_sigma.items():
-            try:
-                week_end_ts = pd.Timestamp(week_end).normalize()
-            except Exception:
-                continue
-            if week_end_ts in test_df.index and sigma is not None and not (isinstance(sigma, float) and np.isnan(sigma)):
-                overrides[week_end_ts] = float(sigma)
-
-    logger.info(f"Per-quarter GARCH: built {len(overrides)} weekly overrides "
-                f"({len(cache)} quarters fit)")
-    return overrides
+# Shared no-lookahead per-quarter GARCH refit lives in utils.garch_utils;
+# imported above as _refit_garch_per_quarter to keep call sites unchanged.
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +234,9 @@ def run_backtest() -> dict:
     costs_list = []
 
     # Config for optimization
-    SL_MULTIPLIER = 3.0  # Stop Loss at 3x entry premium
-    SLIPPAGE_ENTRY = 1.0 # 1 pt slippage per leg on entry
-    SLIPPAGE_EXIT = 0.5  # 0.5 pt slippage per leg on exit (or expiry)
+    SL_MULTIPLIER = cfg.wf_sl_multiplier
+    SLIPPAGE_ENTRY = cfg.wf_slippage_entry
+    SLIPPAGE_EXIT = cfg.wf_slippage_exit
 
     for _, row in results.iterrows():
         close = row["current_close"]
@@ -447,7 +373,7 @@ def run_backtest() -> dict:
     # If down breaches more than up, recommend wider put placement
     skew_imbalance = float(breach_rate_down - breach_rate_up)  # positive = more down breaches
     # Rough heuristic: 1% breach difference ≈ 25 pts of skew needed
-    recommended_put_skew = int(max(0, skew_imbalance * SKEW_PTS_PER_PERCENT_IMBALANCE))
+    recommended_put_skew = int(max(0, skew_imbalance * cfg.skew_pts_per_percent_imbalance))
 
     # POP vs Actual Validation — detect model drift
     pop_accuracy = {}

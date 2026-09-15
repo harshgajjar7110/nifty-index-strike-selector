@@ -45,6 +45,7 @@ sys.path.insert(0, str(BASE_DIR))
 from module6_strikes import generate_strikes
 from spreads.module10_nse_costs import calculate_nse_charges, apply_slippage, estimate_ic_premium
 from utils.utils_constants import REGIMES, load_regime_thresholds, assign_regime_series
+from utils.garch_utils import refit_garch_per_quarter as _refit_garch_per_quarter
 from utils.models_utils import RegimeLGBQuantileWrapper, extract_pis, predict_mu_sigma_p90
 
 # ---------------------------------------------------------------------------
@@ -67,83 +68,8 @@ WF_LOW_THRESH, WF_HIGH_THRESH = load_regime_thresholds()
 # GARCH refit
 # ---------------------------------------------------------------------------
 
-def _refit_garch_per_quarter(test_df, cache):
-    """Refit GARCH per calendar quarter on data <= current quarter end, no lookahead.
-
-    Returns a dict keyed by ``week_end`` Timestamp -> refit ``garch_sigma_mean``
-    for that week. The fit is cached per quarter so we only fit ~N_quarters models.
-    Silently returns an empty dict if daily data or arch package is missing.
-    """
-    daily_path = BASE_DIR / "data" / "nifty_daily.parquet"
-    if not daily_path.exists():
-        logger.warning("nifty_daily.parquet missing -- skipping per-quarter GARCH refit")
-        return {}
-    try:
-        from arch import arch_model
-    except ImportError:
-        logger.warning("arch package unavailable -- skipping per-quarter GARCH refit")
-        return {}
-
-    try:
-        daily = pd.read_parquet(daily_path).sort_index()
-        close_col = None
-        for col in ("close", "Close", "CLOSE", "adj_close", "Adj Close"):
-            if col in daily.columns:
-                close_col = col
-                break
-        if close_col is None and len(daily.columns) > 0:
-            close_col = daily.columns[0]
-        if close_col is None:
-            return {}
-        closes = daily[close_col]
-        if hasattr(closes.index, "normalize"):
-            closes.index = closes.index.normalize()
-    except Exception as e:
-        logger.warning(f"Per-quarter GARCH: failed to load daily data ({e})")
-        return {}
-
-    overrides = {}
-    quarter_starts = pd.to_datetime(test_df.index).to_period("Q").unique()
-    for q in quarter_starts:
-        if q in cache:
-            quarter_sigma = cache[q]
-        else:
-            q_start = max(q.start_time, closes.index.min())
-            q_end = q.end_time
-            hist = closes.loc[closes.index <= q_end]
-            if len(hist) < 60:
-                cache[q] = None
-                continue
-            returns = np.log(hist / hist.shift(1)).dropna() * 100
-            if len(returns) < 60:
-                cache[q] = None
-                continue
-            try:
-                model = arch_model(returns, vol="Garch", p=1, o=1, q=1, dist="skewt")
-                res = model.fit(disp="off")
-                cond_vol = res.conditional_volatility / 100
-                weekly_mean = cond_vol.resample("W-TUE").mean()
-                quarter_sigma = weekly_mean.to_dict()
-            except Exception as e:
-                logger.warning(f"Per-quarter GARCH fit failed for {q}: {e}")
-                quarter_sigma = None
-            cache[q] = quarter_sigma
-        if not quarter_sigma:
-            continue
-        for week_end, sigma in quarter_sigma.items():
-            try:
-                week_end_ts = pd.Timestamp(week_end).normalize()
-            except Exception:
-                continue
-            if (
-                week_end_ts in test_df.index
-                and sigma is not None
-                and not (isinstance(sigma, float) and np.isnan(sigma))
-            ):
-                overrides[week_end_ts] = float(sigma)
-
-    logger.info(f"Per-quarter GARCH: built {len(overrides)} weekly overrides ({len(cache)} quarters fit)")
-    return overrides
+# Shared no-lookahead per-quarter GARCH refit lives in utils.garch_utils;
+# imported above as _refit_garch_per_quarter to keep call sites unchanged.
 
 
 # ---------------------------------------------------------------------------

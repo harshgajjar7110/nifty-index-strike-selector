@@ -28,6 +28,8 @@ class _Config(BaseSettings):
     min_buffer_points: int = Field(default=75, ge=0, le=200)
     put_skew_points: int = Field(default=0, ge=-200, le=200)
     call_skew_points: int = Field(default=0, ge=-200, le=200)
+    p90_blend_weight: float = Field(default=0.70, ge=0.0, le=1.0, description="Weight on P90 in blended half-range: (w*P90 + (1-w)*P10)/2.")
+    mp_blend: float = Field(default=0.30, ge=0.0, le=1.0, description="Fraction to blend strikes toward max pain.")
 
     # ------------------------------------------------------------------
     # Model / calibration
@@ -71,11 +73,16 @@ class _Config(BaseSettings):
     # Credit spread filters
     # ------------------------------------------------------------------
     min_rr_ratio: float = Field(default=0.15, ge=0.0, le=1.0)
-    min_ev_proxy_pts: float = Field(default=0.0, ge=-100.0, le=500.0, description="Drop any spread whose ev_proxy is below this (points). 0.0 disables.")
     min_premium_low_vix_pts: float = Field(default=15.0, ge=1.0)
     min_premium_mid_vix_pts: float = Field(default=25.0, ge=1.0)
     min_premium_high_vix_pts: float = Field(default=40.0, ge=1.0)
-    min_dte_to_trade: int = Field(default=7, ge=0, le=30)
+    min_dte_to_trade: int = Field(default=21, ge=0, le=60)
+    max_dte_to_trade: int = Field(default=50, ge=7, le=90)
+    target_dte: int = Field(default=35, ge=7, le=90)
+    dte_blend_enabled: bool = Field(default=True)
+    neutral_size_mult: float = Field(default=0.5, ge=0.1, le=1.0)
+    trend_boost_ev: float = Field(default=0.15, ge=0.0, le=1.0)
+    spread_delta_target_neutral: float = Field(default=0.45, ge=0.1, le=2.0)
     max_spreads_output: int = Field(default=6, ge=1, le=20)
     min_oi_liquidity: int = Field(default=5000, ge=0)
 
@@ -94,6 +101,9 @@ class _Config(BaseSettings):
     wf_max_vix_trade: float = Field(default=30.0, ge=10.0, le=100.0)
     wf_soft_vix_lower: float = Field(default=15.0, ge=10.0, le=40.0, description="Soft-VIX band lower edge: between this and wf_max_vix_trade, reduce size to wf_soft_size_mult.")
     wf_soft_size_mult: float = Field(default=0.75, ge=0.1, le=1.0, description="Size multiplier for weeks in the soft-VIX band [wf_soft_vix_lower, wf_max_vix_trade].")
+    skew_pts_per_percent_imbalance: int = Field(default=25, ge=0, le=200, description="Points of skew per 1% breach probability imbalance.")
+    nse_expiry_weekday: int = Field(default=1, ge=0, le=6, description="NSE expiry weekday (0=Mon, 1=Tue, ..., 6=Sun).")
+    event_penalty: float = Field(default=0.70, ge=0.0, le=1.0, description="Premium multiplier during event weeks.")
 
     # ------------------------------------------------------------------
     # Fallback / calibrated defaults
@@ -111,9 +121,11 @@ class _Config(BaseSettings):
     pcr_put_tighten_pts: int = Field(default=30, ge=0, le=200)
     pcr_call_tighten_pts: int = Field(default=30, ge=0, le=200)
     direction_confidence_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
-    weight_roc: float = Field(default=0.45, ge=0.0, le=1.0)
-    weight_vix: float = Field(default=0.35, ge=0.0, le=1.0)
-    weight_garch: float = Field(default=0.20, ge=0.0, le=1.0)
+    weight_roc: float = Field(default=0.30, ge=0.0, le=1.0)
+    weight_vix: float = Field(default=0.25, ge=0.0, le=1.0)
+    weight_garch: float = Field(default=0.15, ge=0.0, le=1.0)
+    weight_trend_4w: float = Field(default=0.20, ge=0.0, le=1.0)
+    weight_trend_strength: float = Field(default=0.10, ge=0.0, le=1.0)
     call_skew_factor: float = Field(default=0.01, ge=0.0, le=0.50)
 
     # ------------------------------------------------------------------
@@ -127,6 +139,7 @@ class _Config(BaseSettings):
     ic_max_extra_buffer_pts: int = Field(default=500, ge=0, le=2000)
     ic_min_pop: float = Field(default=0.75, ge=0.0, le=1.0)
     ic_max_breach_prob_per_leg: float = Field(default=0.15, ge=0.0, le=1.0)
+    min_ev_proxy_pts: float = Field(default=0.5, ge=-100.0, le=500.0, description="Drop any spread whose ev_proxy is below this (points). 0.5 disables negative-EV output by default.")
 
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR / ".env"),

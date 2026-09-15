@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "nse-bhavcopy": {
+      "type": "remote",
+      "url": "https://mcp.nseindia.in/bhavcopy/cm/mcp",
+      "enabled": true
+    },
+    "cm-market": {
+      "type": "remote",
+      "url": "https://mcp.nseindia.in/cmmkt/mcp",
+      "enabled": true
+    }
+  }
+}
